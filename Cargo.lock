@@ -1026,6 +1026,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ivarb-executor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "futures-util",
+ "ivarb-engine",
+ "ivarb-protocol",
+ "ivarb-quant",
+ "rand 0.8.8",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "ivarb-frontend"
 version = "0.1.0"
 dependencies = [
@@ -1036,6 +1055,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
@@ -1059,6 +1079,7 @@ dependencies = [
  "axum",
  "futures-util",
  "ivarb-engine",
+ "ivarb-executor",
  "ivarb-protocol",
  "mimalloc",
  "serde",

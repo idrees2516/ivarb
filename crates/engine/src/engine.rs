@@ -22,7 +22,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use ivarb_protocol::{
     ConnState, EdgeMode, EngineStats, FeedMode, HistoryPt, Opportunity, ServerMsg, Snapshot,
-    SpotQuote, VenueId, VenueStatus,
+    SpotQuote, VenueId, VenueStatus, WatchedLeg,
 };
 
 use crate::config::{EngineConfig, VenueSpec};
@@ -41,6 +41,17 @@ pub struct EngineHandles {
     pub signal_rx: mpsc::Receiver<String>,
     /// Shared consensus spots (underlying → price) readable by connectors.
     pub spots_shared: Arc<ArcSwap<FxHashMap<String, f64>>>,
+    /// Advantage-taker → engine: replace the watched-instrument set.
+    pub watch_tx: mpsc::UnboundedSender<WatchCmd>,
+    /// Engine → advantage-taker: live quotes for watched instruments.
+    pub watched: Arc<ArcSwap<FxHashMap<String, Vec<WatchedLeg>>>>,
+}
+
+/// Replace the executor's watched-instrument set (canonical ids like
+/// `BTC-20260926-85000-C`).
+#[derive(Debug)]
+pub enum WatchCmd {
+    Set(Vec<String>),
 }
 
 struct VenueRt {
@@ -69,6 +80,9 @@ pub struct Engine {
     shutdown: watch::Receiver<bool>,
     signal_tx: mpsc::Sender<String>,
     spots_shared: Arc<ArcSwap<FxHashMap<String, f64>>>,
+    watch_rx: mpsc::UnboundedReceiver<WatchCmd>,
+    watched_out: Arc<ArcSwap<FxHashMap<String, Vec<WatchedLeg>>>>,
+    watched_keys: FxHashSet<InstKey>,
 
     interner: Arc<std::sync::Mutex<UnderlyingInterner>>,
     venues: FxHashMap<VenueId, VenueRt>,
@@ -124,6 +138,8 @@ impl Engine {
         signal_tx: mpsc::Sender<String>,
         spots_shared: Arc<ArcSwap<FxHashMap<String, f64>>>,
         interner: Arc<std::sync::Mutex<UnderlyingInterner>>,
+        watch_rx: mpsc::UnboundedReceiver<WatchCmd>,
+        watched_out: Arc<ArcSwap<FxHashMap<String, Vec<WatchedLeg>>>>,
     ) -> Self {
         let mut venues = FxHashMap::default();
         for spec in &cfg.venues {
@@ -169,6 +185,9 @@ impl Engine {
             shutdown,
             signal_tx,
             spots_shared,
+            watch_rx,
+            watched_out,
+            watched_keys: FxHashSet::default(),
             interner,
             venues,
             expiry_ms: FxHashMap::default(),
@@ -208,6 +227,7 @@ impl Engine {
                         None => break,
                     }
                 }
+                Some(cmd) = self.watch_rx.recv() => self.handle_watch(cmd),
                 _ = flush.tick() => self.flush_dirty(),
                 _ = sweep.tick() => self.housekeeping(),
                 _ = snap_tick.tick() => {
@@ -444,10 +464,28 @@ impl Engine {
         }
     }
 
-    fn upsert_opp(&mut self, core: OppCore, und: &str, expiry_ms: i64, now: i64) {
+    fn upsert_opp(&mut self, mut core: OppCore, und: &str, expiry_ms: i64, now: i64) {
+        // Rebuild the id with the readable underlying name: the executor's
+        // watch bridge parses ids back into instruments, so the numeric
+        // interner id must not leak into the wire format.
+        core.id = format!(
+            "{}-{}-{}-{}:{}>{}",
+            und,
+            core.key.date,
+            crate::strategy::fmt_key_strike(core.key.strike()),
+            if core.key.right == crate::key::RIGHT_CALL { "C" } else { "P" },
+            core.buy_venue,
+            core.sell_venue
+        );
         let id = core.id.clone();
         let net = core.net_vp;
         let spot = core.spot;
+        // Mark-mode signals (crossed-book divergences) face a stricter entry
+        // gate: they are only convergence candidates, not executable edges.
+        let entry_gate = match core.edge_mode {
+            EdgeMode::Exec => self.cfg.min_net_vp,
+            EdgeMode::Mark => self.cfg.min_net_vp * self.cfg.mark_gate_mult,
+        };
         match self.opps.entry(id.clone()) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 let st = e.get_mut();
@@ -473,6 +511,19 @@ impl Engine {
                 st.opp.updated_ms = core.updated_ms;
                 st.opp.spot = spot;
                 st.opp.t_years = t_years(now, expiry_ms);
+                // Time-aware strategy refresh (bucket may shift as expiry
+                // approaches — the strategy changes with the clock).
+                let age_ms = (now - st.opp.first_seen_ms).max(0) as f64;
+                let v = core.strategy_view(&self.cfg, age_ms, now);
+                st.opp.tier = v.tier;
+                st.opp.bucket = v.bucket.label().to_string();
+                st.opp.dte = v.dte;
+                st.opp.gate_vp = v.gate_vp;
+                st.opp.ev_vp = v.ev_vp;
+                st.opp.theta_vp_day = v.theta_vp_day;
+                st.opp.patience_s = v.patience_s;
+                st.opp.hold_s = v.hold_s;
+                st.opp.conv_hint = v.conv_hint;
 
                 if net < self.cfg.exit_net_vp {
                     st.opp.retired = true;
@@ -506,12 +557,14 @@ impl Engine {
                 }
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                if net < self.cfg.min_net_vp {
+                if net < entry_gate {
                     return; // below the entry gate — not a signal yet
                 }
                 let mut opp = core.to_opportunity(und, expiry_ms, now, Vec::new());
                 opp.spot = spot;
                 opp.t_years = t_years(now, expiry_ms);
+                // Stamp the time-aware strategy fields on creation.
+                let _v = opp_tier_stamp(&mut opp, &core, &self.cfg, now);
                 let hist = VecDeque::from(vec![(now, net)]);
                 e.insert(OppState {
                     opp,
@@ -551,6 +604,7 @@ impl Engine {
 
     fn housekeeping(&mut self) {
         let now = now_ms();
+        self.publish_watched(now);
         let mut venue_changes = false;
         for rt in self.venues.values_mut() {
             while rt
@@ -724,4 +778,108 @@ impl Engine {
         let items: Vec<VenueStatus> = self.venues.values().map(|rt| rt.status.clone()).collect();
         self.broadcast(ServerMsg::Venues { items });
     }
+
+    /// Replace the watched-instrument set published for the advantage taker.
+    fn handle_watch(&mut self, cmd: WatchCmd) {
+        let WatchCmd::Set(ids) = cmd;
+        let mut keys = FxHashSet::default();
+        for id in ids {
+            if let Some((u, d, k, r)) = crate::key::parse_option_symbol(&id) {
+                let und = self
+                    .interner
+                    .lock()
+                    .map(|mut i| i.intern(&u))
+                    .unwrap_or(0);
+                keys.insert(InstKey {
+                    und,
+                    date: d,
+                    strike_ticks: (k * 10_000.0).round() as u64,
+                    right: r,
+                });
+            }
+        }
+        self.watched_keys = keys;
+        self.publish_watched(now_ms());
+    }
+
+    /// Publish live quotes for watched instruments (called every sweep).
+    fn publish_watched(&mut self, now: i64) {
+        if self.watched_keys.is_empty() {
+            if !self.watched_out.load().is_empty() {
+                self.watched_out.store(Arc::new(FxHashMap::default()));
+            }
+            return;
+        }
+        let mut out: FxHashMap<String, Vec<WatchedLeg>> = FxHashMap::default();
+        let und_names: Vec<String> = {
+            let ig = self.interner.lock();
+            match ig {
+                Ok(i) => i.names.clone(),
+                Err(_) => Vec::new(),
+            }
+        };
+        for key in &self.watched_keys {
+            let und = und_names
+                .get(key.und as usize)
+                .cloned()
+                .unwrap_or_else(|| "?".into());
+            let id = format!(
+                "{}-{}-{}-{}",
+                und,
+                key.date,
+                crate::strategy::fmt_key_strike(key.strike()),
+                if key.right == crate::key::RIGHT_CALL {
+                    "C"
+                } else {
+                    "P"
+                }
+            );
+            let mut legs: Vec<WatchedLeg> = Vec::with_capacity(4);
+            for rt in self.venues.values() {
+                if rt.status.state == ConnState::Disabled || rt.fatal {
+                    continue;
+                }
+                if let Some(q) = rt.quotes.get(key) {
+                    legs.push(WatchedLeg {
+                        venue: rt.spec.id.clone(),
+                        px_bid_unit: q.px_bid_unit,
+                        px_ask_unit: q.px_ask_unit,
+                        px_mark_unit: q.px_mark_unit,
+                        iv_bid_vp: q.iv_bid_vp,
+                        iv_ask_vp: q.iv_ask_vp,
+                        iv_mark_vp: q.iv_mark_vp,
+                        size_bid: q.size_bid,
+                        size_ask: q.size_ask,
+                        contract_size: rt.spec.contract_size,
+                        recv_ms: q.recv_ms,
+                    });
+                }
+            }
+            let _ = now;
+            if !legs.is_empty() {
+                out.insert(id, legs);
+            }
+        }
+        self.watched_out.store(Arc::new(out));
+    }
+}
+
+/// Stamp time-aware strategy fields onto a freshly created opportunity.
+fn opp_tier_stamp(
+    opp: &mut Opportunity,
+    core: &OppCore,
+    cfg: &EngineConfig,
+    now: i64,
+) -> crate::timing::StrategyView {
+    let v = core.strategy_view(cfg, 0.0, now);
+    opp.tier = v.tier;
+    opp.bucket = v.bucket.label().to_string();
+    opp.dte = v.dte;
+    opp.gate_vp = v.gate_vp;
+    opp.ev_vp = v.ev_vp;
+    opp.theta_vp_day = v.theta_vp_day;
+    opp.patience_s = v.patience_s;
+    opp.hold_s = v.hold_s;
+    opp.conv_hint = v.conv_hint;
+    v
 }

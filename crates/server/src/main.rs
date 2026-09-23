@@ -20,11 +20,12 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Json;
 use ivarb_engine::{spawn as spawn_engine, EngineConfig};
-use ivarb_protocol::{ClientMsg, ServerMsg, Snapshot};
-use tokio::sync::broadcast;
+use ivarb_executor::{spawn as spawn_executor, ExecDeps};
+use ivarb_protocol::{ClientMsg, ExecCommand, ExecSnapshot, ServerMsg, Snapshot};
+use tokio::sync::{broadcast, mpsc};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -33,6 +34,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub struct AppState {
     pub snapshot: Arc<ArcSwap<Snapshot>>,
     pub bcast: broadcast::Sender<Arc<String>>,
+    pub exec_snap: Arc<ArcSwap<ExecSnapshot>>,
+    pub exec_cmd: mpsc::UnboundedSender<ExecCommand>,
 }
 
 fn now_ms() -> i64 {
@@ -57,9 +60,21 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = cfg.data_dir.clone();
     let handles = spawn_engine(cfg)?;
 
+    // The advantage taker: consumes engine snapshots, watches live legs,
+    // executes risk-gated two-leg attempts (paper mode by default).
+    let exec = spawn_executor(ExecDeps {
+        snapshot: handles.snapshot.clone(),
+        watched: handles.watched.clone(),
+        watch_tx: handles.watch_tx.clone(),
+        bcast: handles.bcast.clone(),
+        shutdown: handles.shutdown.subscribe(),
+    });
+
     let state = AppState {
         snapshot: handles.snapshot.clone(),
         bcast: handles.bcast.clone(),
+        exec_snap: exec.snapshot.clone(),
+        exec_cmd: exec.cmd_tx.clone(),
     };
 
     // JSONL signal audit writer (best-effort, non-blocking).
@@ -79,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/snapshot", get(api_snapshot))
             .route("/api/opps", get(api_opps))
             .route("/api/venues", get(api_venues))
+            .route("/api/exec", get(api_exec))
+            .route("/api/exec/cmd", post(api_exec_cmd))
             .route("/healthz", get(healthz))
             .fallback_service(serve)
             .with_state(state)
@@ -88,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/snapshot", get(api_snapshot))
             .route("/api/opps", get(api_opps))
             .route("/api/venues", get(api_venues))
+            .route("/api/exec", get(api_exec))
+            .route("/api/exec/cmd", post(api_exec_cmd))
             .route("/healthz", get(healthz))
             .fallback(get(frontend_missing))
             .with_state(state)
@@ -148,6 +167,21 @@ async fn api_opps(State(st): State<AppState>) -> Json<Vec<ivarb_protocol::Opport
 async fn api_venues(State(st): State<AppState>) -> Json<Vec<ivarb_protocol::VenueStatus>> {
     let snap: Arc<Snapshot> = Arc::clone(&st.snapshot.load());
     Json(snap.venues.clone())
+}
+
+async fn api_exec(State(st): State<AppState>) -> Json<ExecSnapshot> {
+    let snap = st.exec_snap.load();
+    Json(snap.as_ref().clone())
+}
+
+async fn api_exec_cmd(
+    State(st): State<AppState>,
+    Json(cmd): Json<ExecCommand>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    st.exec_cmd
+        .send(cmd)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "executor stopped"))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn ws_handler(

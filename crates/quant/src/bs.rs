@@ -73,6 +73,30 @@ pub fn bs_vega(s: f64, k: f64, t: f64, sig: f64) -> f64 {
     s * t.sqrt() * norm_pdf(d1)
 }
 
+/// Black-Scholes theta per **year** per one unit of underlying exposure
+/// (always ≤ 0 for r = q = 0 European options), in the pricing currency.
+#[inline]
+pub fn bs_theta(s: f64, k: f64, t: f64, sig: f64) -> f64 {
+    if s <= 0.0 || k <= 0.0 || t <= 0.0 || sig <= 0.0 {
+        return 0.0;
+    }
+    let (d1, _) = d1_d2(s, k, t, sig);
+    -s * norm_pdf(d1) * sig / (2.0 * t.sqrt())
+}
+
+/// Black-Scholes delta per one unit of underlying exposure.
+#[inline]
+pub fn bs_delta(s: f64, k: f64, t: f64, sig: f64, right: Right) -> f64 {
+    if s <= 0.0 || k <= 0.0 || t <= 0.0 || sig <= 0.0 {
+        return 0.0;
+    }
+    let (d1, _) = d1_d2(s, k, t, sig);
+    match right {
+        Right::Call => norm_cdf(d1),
+        Right::Put => norm_cdf(d1) - 1.0,
+    }
+}
+
 /// Discount-less intrinsic value.
 #[inline]
 pub fn intrinsic(s: f64, k: f64, right: Right) -> f64 {

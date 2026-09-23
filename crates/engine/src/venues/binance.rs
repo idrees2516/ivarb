@@ -101,6 +101,22 @@ impl VenueConnector for Binance {
                             continue;
                         }
                     };
+                    // Executable prices: /eapi/v1/ticker carries bidPrice /
+                    // askPrice for the WHOLE market in one call (no sizes).
+                    let book: HashMap<String, serde_json::Value> =
+                        match http_get_json(&ctx.http, &format!("{}/eapi/v1/ticker", ctx.spec.rest_base)).await {
+                            Ok(t) => t
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|r| {
+                                            js(r, &["symbol"]).map(|s| (s, r.clone()))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            Err(_) => HashMap::new(),
+                        };
                     let rows = v.as_array().cloned().unwrap_or_default();
                     let mut ticks: Vec<InstrTick> = Vec::with_capacity(rows.len().min(2048));
                     let mut spot_seen: HashMap<String, (f64, i64)> = HashMap::new();
@@ -119,14 +135,17 @@ impl VenueConnector for Binance {
                         let pxu = |names: &[&str]| -> Option<f64> {
                             jf(r, names).map(|p| p / size_hint).filter(|p| p.is_finite() && *p > 0.0)
                         };
+                        let t = book.get(&sym);
+                        let bp = t.and_then(|t| jf(t, &["bidPrice"])).filter(|p| *p > 0.0);
+                        let ap = t.and_then(|t| jf(t, &["askPrice"])).filter(|p| *p > 0.0);
                         ticks.push(InstrTick {
                             key: *key,
                             iv_mark_vp: jf(r, &["markIV", "markIv", "mark_iv"]).and_then(norm_iv_vp),
                             iv_bid_vp: jf(r, &["bidIV", "bidIv", "bid_iv"]).and_then(norm_iv_vp),
                             iv_ask_vp: jf(r, &["askIV", "askIv", "ask_iv"]).and_then(norm_iv_vp),
                             px_mark_unit: pxu(&["markPrice", "mark_price"]),
-                            px_bid_unit: None,
-                            px_ask_unit: None,
+                            px_bid_unit: bp.map(|p| p / size_hint).filter(|p| p.is_finite() && *p > 0.0),
+                            px_ask_unit: ap.map(|p| p / size_hint).filter(|p| p.is_finite() && *p > 0.0),
                             size_bid: jf(r, &["bidQty", "bid_qty"]),
                             size_ask: jf(r, &["askQty", "ask_qty"]),
                             spot: ipx,

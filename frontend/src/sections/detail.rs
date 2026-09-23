@@ -73,6 +73,8 @@ pub fn DetailPanel() -> impl IntoView {
                                 "Verify the IV spread on both exchange UIs right now. The scanner reads from live feeds; confirm it matches the order book you will trade against. Place both legs within seconds of each other — if the second leg does not fill in 10 seconds, cancel and unwind."
                             </div>
 
+                            <ExecPlan o=o.clone()/>
+
                             <div class="detail-grid">
                                 <div class="detail-chart">
                                     <div class="dc-title">
@@ -113,6 +115,69 @@ you collect {net:.2} vol points net. At ~{vega} vega/contract, that is \u{2248} 
         vega = fmt::fmt_usd(o.vega_vp_usd),
         est = fmt::fmt_usd(o.est_usd),
     )
+}
+
+/// The advantage taker's plan for this signal: tier, effective gate,
+/// expected value, patience/hold windows and theta burn, plus a manual TAKE.
+#[component]
+fn ExecPlan(o: Opportunity) -> impl IntoView {
+    let st = use_context::<ApiState>().unwrap();
+    let take_id = o.id.clone();
+    let tier = o.tier;
+    let tier_cls = match tier {
+        ivarb_protocol::Tier::Sniper => "sniper",
+        ivarb_protocol::Tier::Convergence => "conv",
+        ivarb_protocol::Tier::Monitor => "watch",
+    };
+    let plan: Vec<(&'static str, String)> = vec![
+        ("strategy tier", format!("{} — {}", tier.label(), match tier {
+            ivarb_protocol::Tier::Sniper => "both legs at the touch immediately",
+            ivarb_protocol::Tier::Convergence => "passive quotes on both venues, capture on convergence",
+            ivarb_protocol::Tier::Monitor => "not executable right now (edge below gate or quotes stale)",
+        })),
+        ("theta bucket", format!("{} ({:.1} days to expiry)", o.bucket, o.dte)),
+        ("effective gate", format!("{:+.2} vp (base × bucket × regime × age)", o.gate_vp)),
+        ("expected value", format!("{:+.2} vp after fill-probability, slippage, single-leg risk and theta burn", o.ev_vp)),
+        ("theta burn", format!("{:.2} vp/day raw · hedged arb nets most of it", o.theta_vp_day)),
+        ("patience / max hold", format!("{} / {}", fmt_secs(o.patience_s), fmt_secs(o.hold_s))),
+        ("convergence hint", if o.conv_hint { "favorable — the rich leg is fading toward the cheap leg".into() } else { "neutral".into() }),
+    ];
+    view! {
+        <div class="exec-plan">
+            <div class="ep-head">
+                <h4>"Execution plan"</h4>
+                <span class="ep-sub">"what the advantage taker will do with this signal"</span>
+                <button class="take-btn big"
+                    on:click=move |_| st.send_exec_cmd(
+                        ivarb_protocol::ExecCommand::Take { opp: take_id.clone(), units: None },
+                        format!("TAKE sent — risk gates will size it"),
+                    )>
+                    "⚡ TAKE THIS TRADE"
+                </button>
+            </div>
+            <div class="ep-grid">
+                <For each=move || plan.clone() key=|(k, _)| *k let:f>
+                    {let (k, v) = f;
+                     view! {
+                        <div class="ep-cell">
+                            <div class="fact-k">{k}</div>
+                            <div class=format!("fact-v {}", if k == "strategy tier" { tier_cls } else { "" })>{v}</div>
+                        </div>
+                    }}
+                </For>
+            </div>
+        </div>
+    }
+}
+
+fn fmt_secs(s: f64) -> String {
+    if s < 90.0 {
+        format!("{s:.0}s")
+    } else if s < 5400.0 {
+        format!("{:.0}m", s / 60.0)
+    } else {
+        format!("{:.1}h", s / 3600.0)
+    }
 }
 
 fn lead_lag_hint(o: &Opportunity, now: i64) -> String {

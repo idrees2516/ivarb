@@ -88,9 +88,11 @@ pub fn ScannerSection() -> impl IntoView {
                             <th class="th-dir">"Direction (buy → sell)"</th>
                             <th class="th-spread">"Spread − Fee"</th>
                             <th class="th-net">"Net"</th>
+                            <th class="th-ev">"EV"</th>
                             <th class="th-vega">"Vega"</th>
                             <th class="th-est">"Est $/ct"</th>
                             <th class="th-mode">"Mode"</th>
+                            <th class="th-take"></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -137,6 +139,7 @@ fn ScannerRow(o: ivarb_protocol::Opportunity) -> impl IntoView {
     let o2 = o.clone();
     let o3 = o.clone();
     let o4 = o.clone();
+    let o5 = o.clone();
     let id = o.id.clone();
     let selected = Memo::new(move |_| st.selected.get().as_deref() == Some(id.as_str()));
     let stale = o.stale;
@@ -144,6 +147,8 @@ fn ScannerRow(o: ivarb_protocol::Opportunity) -> impl IntoView {
     let buy_name = fmt::venue_name(&o.buy_venue);
     let sell_name = fmt::venue_name(&o.sell_venue);
     let click_id = o.id.clone();
+    let take_id = o.id.clone();
+    let take_st = st.clone();
 
     view! {
         <tr class=move || {
@@ -177,13 +182,41 @@ fn ScannerRow(o: ivarb_protocol::Opportunity) -> impl IntoView {
                     {move || format!("{:+.2} vp", o4.net_vp)}
                 </span>
             </td>
+            <td class="td-ev">
+                <span class=(move || if o5.ev_vp >= 0.1 { "net-pos" } else { "dim" })>
+                    {move || format!("{:+.2}", o5.ev_vp)}
+                </span>
+            </td>
             <td class="td-vega">{fmt::fmt_usd(o.vega_vp_usd)}</td>
             <td class="td-est">{fmt::fmt_usd(o.est_usd)}</td>
             <td class="td-mode">
                 <span class=(move || if mode_exec { "mode-chip exec" } else { "mode-chip mark" })>
                     {if mode_exec { "EXEC" } else { "MARK" }}
                 </span>
+                <span class=format!("tier-chip {}", tier_cls(&o.tier))>{o.tier.label()}</span>
+                <span class="bucket-chip">{o.bucket.clone()}</span>
+            </td>
+            <td class="td-take">
+                <button class="take-btn"
+                    title="Send this signal to the advantage taker (risk-gated)"
+                    on:click=move |ev| {
+                        ev.stop_propagation();
+                        take_st.send_exec_cmd(
+                            ivarb_protocol::ExecCommand::Take { opp: take_id.clone(), units: None },
+                            format!("TAKE sent — {}", take_id.split(':').next().unwrap_or(&take_id)),
+                        );
+                    }>
+                    "TAKE"
+                </button>
             </td>
         </tr>
+    }
+}
+
+fn tier_cls(t: &ivarb_protocol::Tier) -> &'static str {
+    match t {
+        ivarb_protocol::Tier::Sniper => "sniper",
+        ivarb_protocol::Tier::Convergence => "conv",
+        ivarb_protocol::Tier::Monitor => "watch",
     }
 }

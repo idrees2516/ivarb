@@ -77,6 +77,9 @@ pub struct EngineConfig {
     pub min_vega_usd: f64,
     /// Spreads wider than this (vp) are treated as stale/fantasy quotes.
     pub max_spread_vp: f64,
+    /// Entry-gate multiplier for mark-mode (convergence-candidate) signals
+    /// relative to the executable-edge gate.
+    pub mark_gate_mult: f64,
 }
 
 impl Default for EngineConfig {
@@ -106,6 +109,7 @@ impl Default for EngineConfig {
             signal_moneyness_pct: 0.12,
             min_vega_usd: 1.0,
             max_spread_vp: 25.0,
+            mark_gate_mult: 1.5,
         }
     }
 }
@@ -187,9 +191,11 @@ pub fn default_venues() -> Vec<VenueSpec> {
             taker_fee_rate: 0.0003,
             coin_margined: false,
             contract_size: 1.0,
-            ws_url: "wss://api.derive.xyz/ws".into(),
-            rest_base: "https://api.derive.xyz".into(),
-            poll_ms: 10_000,
+            // Derive's RPC API lives on the lyra.finance host (probed live:
+            // POST /public/get_instruments + /public/get_tickers per expiry).
+            ws_url: "wss://api.lyra.finance/ws".into(),
+            rest_base: "https://api.lyra.finance".into(),
+            poll_ms: 6_000,
             enabled: true,
         },
         VenueSpec {

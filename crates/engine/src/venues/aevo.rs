@@ -167,11 +167,134 @@ impl VenueConnector for Aevo {
                     } else if usable == 0 {
                         return Err(anyhow::anyhow!("aevo: /markets rows carry no usable quote fields"));
                     }
+
+                    // --- executable prices: /orderbook per instrument --------------
+                    // /markets carries marks only; the public /orderbook endpoint
+                    // gives the real touch (price, amount, level-IV). Poll a
+                    // bounded near-ATM set every cycle to keep the taker's
+                    // legs executable.
+                    let books = self.poll_books(&ctx, &index).await;
+                    if !books.is_empty() {
+                        let _ = ctx.tx.send(VenueMsg::Ticks {
+                            venue: "aevo".into(),
+                            ticks: books,
+                        }).await;
+                    }
                 }
                 _ = ctx.shutdown.changed() => {
                     if *ctx.shutdown.borrow() { return Ok(()); }
                 }
             }
         }
+    }
+}
+
+impl Aevo {
+    /// Poll `/orderbook` for the nearest-ATM strikes on the nearest two
+    /// expiries per underlying (≤ 40 requests per cycle).
+    async fn poll_books(
+        &self,
+        ctx: &VenueCtx,
+        index: &HashMap<String, InstKey>,
+    ) -> Vec<InstrTick> {
+        // Select: nearest 2 expiries × strikes within ±5% of consensus spot.
+        let mut by_und: HashMap<String, Vec<(u32, f64, u8, String)>> = HashMap::new();
+        for (name, key) in index {
+            let und = ctx
+                .interner
+                .lock()
+                .ok()
+                .map(|i| i.name(key.und).to_string())
+                .unwrap_or_default();
+            if und.is_empty() {
+                continue;
+            }
+            let spot = match ctx.consensus_spot(&und) {
+                Some(s) if s > 0.0 => s,
+                _ => continue,
+            };
+            let strike = key.strike();
+            if (strike / spot).ln().abs() > 0.05 {
+                continue;
+            }
+            by_und
+                .entry(und)
+                .or_default()
+                .push((key.date, strike, key.right, name.clone()));
+        }
+        let mut selected: Vec<String> = Vec::with_capacity(48);
+        for (_, mut rows) in by_und {
+            rows.sort_by_key(|(d, _, _, _)| *d);
+            let dates: Vec<u32> = {
+                let mut ds: Vec<u32> = rows.iter().map(|(d, _, _, _)| *d).collect();
+                ds.sort_unstable();
+                ds.dedup();
+                ds.into_iter().take(2).collect()
+            };
+            for (d, k, _right, name) in rows {
+                if dates.contains(&d) && !selected.contains(&name) {
+                    selected.push(name);
+                }
+            }
+        }
+        selected.truncate(40);
+
+        let mut ticks: Vec<InstrTick> = Vec::with_capacity(selected.len());
+        for name in selected {
+            if ctx.shutdown() {
+                break;
+            }
+            let Some(key) = index.get(&name) else { continue };
+            let url = format!("{}/orderbook?instrument_name={name}", ctx.spec.rest_base);
+            let Ok(v) = crate::venues::http_get_json_tmo(
+                &ctx.http,
+                &url,
+                std::time::Duration::from_secs(6),
+            )
+            .await else {
+                continue;
+            };
+            let best = |side: &str| -> Option<(f64, f64, Option<f64>)> {
+                let arr = v.get(side)?.as_array()?;
+                // entries: [price, amount, iv]; best = first (book is sorted).
+                for lvl in arr {
+                    let px = lvl.get(0).and_then(|x| x.as_f64())?;
+                    let amt = lvl.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let iv = lvl.get(2).and_then(|x| x.as_f64());
+                    if px > 0.0 {
+                        return Some((px, amt, iv));
+                    }
+                }
+                None
+            };
+            let (bid, bid_sz, bid_iv) = match best("bids") {
+                Some(x) => x,
+                None => (0.0, 0.0, None),
+            };
+            let (ask, ask_sz, ask_iv) = match best("asks") {
+                Some(x) => x,
+                None => (0.0, 0.0, None),
+            };
+            if bid <= 0.0 && ask <= 0.0 {
+                continue; // genuinely empty book
+            }
+            let mark = jf(&v, &["mark_price", "markPrice"]);
+            let spot = jf(&v, &["index_price", "indexPrice", "underlying_price"]);
+            ticks.push(InstrTick {
+                key: *key,
+                iv_mark_vp: jf(&v, &["mark_iv", "markIv"]).and_then(norm_iv_vp),
+                iv_bid_vp: bid_iv.and_then(norm_iv_vp),
+                iv_ask_vp: ask_iv.and_then(norm_iv_vp),
+                px_mark_unit: mark.filter(|p| p.is_finite() && *p > 0.0),
+                px_bid_unit: (bid > 0.0).then_some(bid),
+                px_ask_unit: (ask > 0.0).then_some(ask),
+                size_bid: (bid > 0.0).then_some(bid_sz),
+                size_ask: (ask > 0.0).then_some(ask_sz),
+                spot,
+                contract_size: Some(ctx.spec.contract_size),
+                venue_ts_ms: jf(&v, &["last_updated"]).map(|t| (t / 1_000_000.0) as i64),
+            });
+        }
+        ticks
     }
 }

@@ -4,6 +4,7 @@ members = [
     "crates/protocol",
     "crates/quant",
     "crates/engine",
+    "crates/executor",
     "crates/server",
     "frontend",
 ]

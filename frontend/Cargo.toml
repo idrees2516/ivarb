@@ -10,6 +10,7 @@ ivarb-quant = { path = "../crates/quant" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "console",
@@ -20,4 +21,8 @@ web-sys = { version = "0.3", features = [
     "Event",
     "Window",
     "Location",
+    "Request",
+    "RequestInit",
+    "Headers",
+    "Response",
 ] }

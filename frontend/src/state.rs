@@ -4,11 +4,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use ivarb_protocol::{
-    EngineStats, HistoryPt, Opportunity, ServerMsg, SpotQuote, VenueStatus,
+    EngineStats, ExecCommand, ExecSnapshot, HistoryPt, Opportunity, ServerMsg, SpotQuote,
+    VenueStatus,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,11 +45,14 @@ pub struct ApiState {
     pub venues: RwSignal<Vec<VenueStatus>>,
     pub stats: RwSignal<Option<EngineStats>>,
     pub spots: RwSignal<Vec<SpotQuote>>,
+    pub exec: RwSignal<Option<ExecSnapshot>>,
     pub selected: RwSignal<Option<String>>,
     pub sort: RwSignal<SortMode>,
     pub und_filter: RwSignal<UndFilter>,
     pub ws_state: RwSignal<WsState>,
     pub now: RwSignal<i64>,
+    /// Flash message after a taker command ("armed", "rejected"…).
+    pub flash: RwSignal<Option<String>>,
 }
 
 thread_local! {
@@ -84,16 +89,30 @@ impl ApiState {
             venues: RwSignal::new(Vec::new()),
             stats: RwSignal::new(None),
             spots: RwSignal::new(Vec::new()),
+            exec: RwSignal::new(None),
             selected: RwSignal::new(None),
             sort: RwSignal::new(SortMode::Newest),
             und_filter: RwSignal::new(UndFilter::All),
             ws_state: RwSignal::new(WsState::Connecting),
             now: RwSignal::new(now_ms()),
+            flash: RwSignal::new(None),
         };
         CURRENT.with(|c| *c.borrow_mut() = Some(st.clone()));
         st.connect_ws();
         st.start_ticker();
         st
+    }
+
+    /// POST a command to the advantage taker (fire-and-forget with a flash).
+    pub fn send_exec_cmd(&self, cmd: ExecCommand, label: String) {
+        let flash = self.flash;
+        spawn_local(async move {
+            match post_json("/api/exec/cmd", &cmd).await {
+                true => flash.set(Some(label)),
+                false => flash.set(Some(format!("{label} — executor unreachable"))),
+            }
+            set_timeout(4000, move || flash.set(None));
+        });
     }
 
     fn start_ticker(&self) {
@@ -135,6 +154,7 @@ impl ApiState {
         }
 
         {
+            let set_exec = self.exec.write_only();
             let cb = Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
                 let txt = match ev.data().as_string() {
                     Some(t) => t,
@@ -201,6 +221,7 @@ impl ApiState {
                     ServerMsg::Venues { items } => set_venues.set(items),
                     ServerMsg::Stats { stats } => set_stats.set(Some(stats)),
                     ServerMsg::Spots { items } => set_spots.set(items),
+                    ServerMsg::Exec { exec } => set_exec.set(Some(exec)),
                 }
             }) as Box<dyn FnMut(web_sys::MessageEvent)>);
             ws.set_onmessage(Some(cb.as_ref().unchecked_ref()));
@@ -243,5 +264,25 @@ impl ApiState {
                 }
             });
         });
+    }
+}
+
+/// POST JSON to the server; returns success.
+async fn post_json<T: serde::Serialize>(url: &str, body: &T) -> bool {
+    let Ok(body) = serde_json::to_string(body) else { return false };
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("POST");
+    opts.set_body(&wasm_bindgen::JsValue::from_str(&body));
+    let headers = web_sys::Headers::new().ok();
+    if let Some(h) = &headers {
+        let _ = h.set("Content-Type", "application/json");
+        opts.set_headers(h);
+    }
+    let Ok(req) = web_sys::Request::new_with_str_and_init(url, &opts) else { return false };
+    let Some(win) = web_sys::window() else { return false };
+    let resp = wasm_bindgen_futures::JsFuture::from(win.fetch_with_request(&req)).await;
+    match resp {
+        Ok(v) => web_sys::Response::from(v).ok(),
+        Err(_) => false,
     }
 }

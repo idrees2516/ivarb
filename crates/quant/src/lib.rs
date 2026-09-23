@@ -7,7 +7,7 @@ mod bs;
 mod fees;
 mod iv;
 
-pub use bs::{bs_price, bs_vega, d1_d2, intrinsic, norm_cdf, norm_pdf};
+pub use bs::{bs_delta, bs_price, bs_theta, bs_vega, d1_d2, intrinsic, norm_cdf, norm_pdf};
 pub use fees::{fee_vp, vega_per_vp};
 pub use iv::implied_vol;
 

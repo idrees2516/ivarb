@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 ivarb-engine = { path = "../engine" }
 ivarb-protocol = { path = "../protocol" }
+ivarb-executor = { path = "../executor" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "net"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["fs"] }

@@ -4,7 +4,7 @@
 use leptos::prelude::*;
 
 use crate::fmt;
-use crate::sections::{calc, risk, scanner, steps, venues};
+use crate::sections::{calc, risk, scanner, steps, taker, venues};
 use crate::state::{ApiState, WsState};
 
 #[component]
@@ -20,6 +20,7 @@ pub fn App() -> impl IntoView {
             <main class="content">
                 <scanner::ScannerSection/>
                 <LegendSection/>
+                <taker::TakerSection/>
                 <calc::MathSection/>
                 <steps::StepsSection/>
                 <venues::VenuesSection/>
@@ -34,6 +35,7 @@ pub fn App() -> impl IntoView {
 fn TopBar() -> impl IntoView {
     let st = use_context::<ApiState>().unwrap();
     let stats = Memo::new(move |_| st.stats.get());
+    let exec = Memo::new(move |_| st.exec.get());
     let venue_pills = Memo::new(move |_| {
         st.venues
             .get()
@@ -104,6 +106,35 @@ fn TopBar() -> impl IntoView {
                             format!("{:.0} µs", s.as_ref().map(|x| x.engine_loop_us_ewma).unwrap_or(0.0))
                         }
                         class_extra=|| String::new()/>
+                    <StatChip label="taker"
+                        value=move || {
+                            let e = exec.get();
+                            match e {
+                                Some(e) if e.stats.kill.is_some() => "KILLED".into(),
+                                Some(e) if e.stats.armed => format!("ARMED · {} pos", e.stats.positions_open),
+                                Some(e) => format!("{} · off", match e.stats.mode { ivarb_protocol::ExecMode::Paper => "paper", ivarb_protocol::ExecMode::Live => "live" }),
+                                None => "—".into(),
+                            }
+                        }
+                        class_extra=move || {
+                            let e = exec.get();
+                            if e.as_ref().map(|x| x.stats.kill.is_some()).unwrap_or(false) { " red".to_string() }
+                            else if e.as_ref().map(|x| x.stats.armed).unwrap_or(false) { "".to_string() }
+                            else { " amber".to_string() }
+                        }/>
+                    <StatChip label="session P&L"
+                        value=move || {
+                            let e = exec.get();
+                            match e {
+                                Some(e) => fmt::fmt_usd(e.stats.realized_usd + e.stats.unrealized_usd),
+                                None => "—".into(),
+                            }
+                        }
+                        class_extra=move || {
+                            let e = exec.get();
+                            let pnl = e.map(|x| x.stats.realized_usd + x.stats.unrealized_usd).unwrap_or(0.0);
+                            if pnl >= 0.0 { "".to_string() } else { " red".to_string() }
+                        }/>
                     <div class="ws-state">
                         {move || {
                             match st.ws_state.get() {
@@ -203,11 +234,12 @@ fn Hero() -> impl IntoView {
         <section class="hero">
             <div class="hero-copy">
                 <h1>"The Arb Scanner finds moments when the same option contract trades at a materially different implied volatility across two exchanges."</h1>
-                <p>"This guide shows you how to read those signals, calculate whether the spread is worth it after fees, and execute both legs cleanly."</p>
+                <p>"This guide shows you how to read those signals, calculate whether the spread is worth it after fees, and execute both legs cleanly. The advantage taker below can execute them for you — risk-gated, paper by default."</p>
                 <div class="hero-tags">
                     <span class="tag">"8 exchanges wired"</span>
                     <span class="tag">"fee-adjusted math built in"</span>
-                    <span class="tag">"7-step execution flow"</span>
+                    <span class="tag">"auto-execution engine"</span>
+                    <span class="tag">"time-aware strategies"</span>
                 </div>
             </div>
             <div class="hero-stats">

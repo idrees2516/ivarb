@@ -9,6 +9,7 @@ pub mod jsonutil;
 pub mod key;
 pub mod msg;
 pub mod strategy;
+pub mod timing;
 pub mod venues;
 
 use std::sync::Arc;
@@ -73,6 +74,9 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
     }));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (sig_tx, sig_rx) = mpsc::channel::<String>(8192);
+    let (watch_tx, watch_rx) = mpsc::unbounded_channel::<engine::WatchCmd>();
+    let watched: Arc<ArcSwap<FxHashMap<String, Vec<ivarb_protocol::WatchedLeg>>>> =
+        Arc::new(ArcSwap::from_pointee(FxHashMap::default()));
     let interner = Arc::new(std::sync::Mutex::new(key::UnderlyingInterner::default()));
     let spots_shared: Arc<ArcSwap<FxHashMap<String, f64>>> =
         Arc::new(ArcSwap::from_pointee(FxHashMap::default()));
@@ -99,6 +103,8 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
         sig_tx,
         spots_shared.clone(),
         interner.clone(),
+        watch_rx,
+        watched.clone(),
     )
     .run());
 
@@ -179,5 +185,7 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
         shutdown: shutdown_tx,
         signal_rx: sig_rx,
         spots_shared,
+        watch_tx,
+        watched,
     })
 }

@@ -9,6 +9,7 @@ use ivarb_quant::{bs_price, bs_vega, fee_vp, vega_per_vp, Right};
 use crate::config::{EngineConfig, VenueSpec};
 use crate::key::{iso_from_ymd, t_years, InstKey};
 use crate::msg::InstrTick;
+use crate::timing::{self, SignalCtx, StrategyView};
 
 /// Live quote state for one (venue, instrument).
 #[derive(Debug, Clone)]
@@ -148,6 +149,15 @@ fn to_pright(r: u8) -> PRight {
     }
 }
 
+/// Format a strike for canonical ids: integers without a decimal tail.
+pub fn fmt_key_strike(strike: f64) -> String {
+    if (strike - strike.round()).abs() < 1e-9 {
+        format!("{}", strike.round() as i64)
+    } else {
+        format!("{strike}")
+    }
+}
+
 fn to_qright(r: u8) -> Right {
     if r == crate::key::RIGHT_CALL {
         Right::Call
@@ -182,6 +192,11 @@ pub struct OppCore {
     pub drift_sell_vp_1m: f64,
     pub spot: f64,
     pub updated_ms: i64,
+    /// Expiry timestamp (ms) — needed by the time-aware strategy layer.
+    pub expiry_ms: i64,
+    /// Strategy inputs needed by the time-aware layer (quote age, depth).
+    pub quote_age_ms: f64,
+    pub depth_units: Option<f64>,
 }
 
 impl OppCore {
@@ -228,7 +243,45 @@ impl OppCore {
             retired: false,
             hist_pt: None,
             history: None,
+            tier: ivarb_protocol::Tier::Monitor,
+            bucket: "".into(),
+            dte: 0.0,
+            gate_vp: 0.0,
+            ev_vp: 0.0,
+            theta_vp_day: 0.0,
+            patience_s: 0.0,
+            hold_s: 0.0,
+            conv_hint: false,
         }
+    }
+
+    /// Time-aware strategy view for this core; used by the engine to stamp
+    /// tier/gate/EV fields on the opportunity.
+    pub fn strategy_view(
+        &self,
+        cfg: &EngineConfig,
+        signal_age_ms: f64,
+        now_ms: i64,
+    ) -> StrategyView {
+        let iv_mid_raw = ((self.iv_buy_vp + self.iv_sell_vp) * 0.5 / 100.0).max(1e-3);
+        timing::evaluate(
+            &SignalCtx {
+                net_vp: self.net_vp,
+                fee_vp: self.fee_vp,
+                exec_mode: matches!(self.edge_mode, EdgeMode::Exec),
+                quote_age_ms: self.quote_age_ms,
+                signal_age_ms,
+                depth_units: self.depth_units,
+                drift_buy_vp: self.drift_buy_vp_1m,
+                drift_sell_vp: self.drift_sell_vp_1m,
+                spot: self.spot,
+                strike: self.key.strike(),
+                t_years: t_years(now_ms, self.expiry_ms),
+                iv_mid_raw,
+                base_gate_vp: cfg.min_net_vp,
+            },
+            now_ms,
+        )
     }
 }
 
@@ -250,39 +303,84 @@ fn eval_dir(
     let (spec_a, qa) = a;
     let (spec_b, qb) = b;
 
-    let exec_buy = qa.iv_ask_vp?;
-    let exec_sell = qb.iv_bid_vp?;
-    let iv_buy = exec_buy;
-    let iv_sell = exec_sell;
+    // --- the edge is a PREMIUM spread, not a venue-IV spread ----------------
+    //
+    // Venues publish IVs on their *own* forwards: Bybit's USDT options mark
+    // on `underlyingPrice` (≈ futures, ~1.3% over spot at a 3-month tenor),
+    // Binance marks with an explicit 5.4% risk-free rate, Deribit's
+    // coin-margined marks sit near index. Mixing venue IVs across venues
+    // fabricates 2-4 vp "spreads" that do not exist in the premiums you can
+    // actually trade, and re-solving those premiums on a single r=0 basis
+    // distorts deep-ITM legs instead.
+    //
+    // The executable truth: both legs of the same contract settle on
+    // (approximately) the same index at expiry, so the capturable edge is
+    // simply the premium difference, converted to vol points through ONE
+    // consistent vega. Venue IVs remain on the wire as display context.
+    let t = t_years(now, expiry_ms);
+    let strike = key.strike();
+
+    // Vega per vp per unit from the venue's own mark IV (a conversion factor
+    // only — vega is flat enough that the forward basis does not matter).
+    let vega_of = |iv_vp: Option<f64>| -> Option<f64> {
+        let iv = (iv_vp.filter(|v| *v > 0.0).unwrap_or(50.0) / 100.0).clamp(0.01, 4.0);
+        let v = vega_per_vp(bs_vega(spot, strike, t, iv), 1.0);
+        v.is_finite().then_some(v)
+    };
+    let vega_buy_unit = vega_of(qa.iv_mark_vp)?;
+    let vega_sell_unit = vega_of(qb.iv_mark_vp)?;
+    if vega_buy_unit < cfg.min_vega_usd || vega_sell_unit < cfg.min_vega_usd {
+        return None;
+    }
+
+    let pos = |p: Option<f64>| p.filter(|x| x.is_finite() && *x > 0.0);
+    let (buy_px, sell_px, mode) = match (pos(qa.px_ask_unit), pos(qb.px_bid_unit)) {
+        (Some(pa), Some(pb)) => (pa, pb, EdgeMode::Exec),
+        // No executable pair in this direction: fall back to mark premiums so
+        // the CONVERGENCE tier can see divergences inside crossed books
+        // (mark signals face a stricter entry gate upstream).
+        _ => (pos(qa.px_mark_unit)?, pos(qb.px_mark_unit)?, EdgeMode::Mark),
+    };
+
+    // The signal: premium spread in vol points on one common vega.
+    let spread = (sell_px - buy_px) / vega_buy_unit;
+
+    // Cross-leg price sanity: a genuine cross-venue arb never shows one leg
+    // at a fraction of the other. Dust quotes on empty books (a stale
+    // bidPrice of $100 on a $9,800 option) are rejected outright.
+    let ratio = sell_px / buy_px;
+    if !(0.5..=2.0).contains(&ratio) {
+        return None;
+    }
+
+    // Display IVs: venue-quoted when present, solved from the premium as a
+    // fallback (context only — never used for the edge).
+    let iv_of = |px: f64| -> Option<f64> {
+        ivarb_quant::implied_vol(px, spot, strike, t, to_qright(key.right))
+            .map(|iv| iv * 100.0)
+            .filter(|v| v.is_finite())
+    };
+    let iv_buy = qa.iv_ask_vp.or_else(|| iv_of(buy_px)).unwrap_or(0.0);
+    let iv_sell = qb.iv_bid_vp.or_else(|| iv_of(sell_px)).unwrap_or(0.0);
 
     // Sanity band: legs quoted at fantasy IV levels are not tradable edges.
-    if !(cfg.iv_min_vp..=cfg.iv_max_vp).contains(&iv_buy)
-        || !(cfg.iv_min_vp..=cfg.iv_max_vp).contains(&iv_sell)
-    {
+    if iv_buy > 0.0 && !(cfg.iv_min_vp..=cfg.iv_max_vp).contains(&iv_buy) {
+        return None;
+    }
+    if iv_sell > 0.0 && !(cfg.iv_min_vp..=cfg.iv_max_vp).contains(&iv_sell) {
         return None;
     }
     // A spread wider than any real cross-venue divergence is a stale quote.
-    if iv_sell - iv_buy > cfg.max_spread_vp {
+    if spread > cfg.max_spread_vp {
         return None;
     }
     // Moneyness band: deep wings are where cross-venue quote garbage lives.
-    let strike = key.strike();
-    if ((strike / spot).ln().abs()) > cfg.signal_moneyness_pct {
-        return None;
-    }
-
-    let iv_buy_mark = qa.iv_mark_vp.unwrap_or(exec_buy);
-    let iv_sell_mark = qb.iv_mark_vp.unwrap_or(exec_sell);
-
-    let t = t_years(now, expiry_ms);
-    let _right = to_qright(key.right);
-
-    // Vega per vol point per 1 underlying unit, from each leg's own mark IV.
-    let vega_buy_unit = vega_per_vp(bs_vega(spot, strike, t, iv_buy_mark / 100.0), 1.0);
-    let vega_sell_unit = vega_per_vp(bs_vega(spot, strike, t, iv_sell_mark / 100.0), 1.0);
-    if !(vega_buy_unit.is_finite() && vega_sell_unit.is_finite())
-        || vega_buy_unit < cfg.min_vega_usd
-    {
+    // The band tightens with short DTE (1.5 sd of the tenor): a 12% OTM
+    // strike is reasonable at 30 days but pure dust-quote territory at 2.
+    let iv_ref = (qa.iv_mark_vp.unwrap_or(50.0).max(qb.iv_mark_vp.unwrap_or(50.0)) / 100.0)
+        .clamp(0.05, 3.0);
+    let mny_cap = (1.5 * iv_ref * t.sqrt()).min(cfg.signal_moneyness_pct);
+    if ((strike / spot).ln().abs()) > mny_cap {
         return None;
     }
 
@@ -293,7 +391,6 @@ fn eval_dir(
         return None;
     }
 
-    let spread = iv_sell - iv_buy;
     let net = spread - fee;
 
     let size_a = qa.contract_size_hint().unwrap_or(spec_a.contract_size);
@@ -306,9 +403,6 @@ fn eval_dir(
         _ => None,
     };
     let total_usd = max_units.map(|u| net * vega_buy_unit * u);
-
-    let buy_px_usd = qa.px_ask_unit.map(|p| p * size_a);
-    let sell_px_usd = qb.px_bid_unit.map(|p| p * size_b);
 
     Some(OppCore {
         id: format!(
@@ -328,18 +422,14 @@ fn eval_dir(
         iv_spread_vp: spread,
         fee_vp: fee,
         net_vp: net,
-        edge_mode: if qa.iv_ask_vp.is_some() && qb.iv_bid_vp.is_some() {
-            EdgeMode::Exec
-        } else {
-            EdgeMode::Mark
-        },
+        edge_mode: mode,
         vega_vp_usd,
         est_usd,
         contract_size: size_a,
         max_units,
         total_usd,
-        buy_px_usd,
-        sell_px_usd,
+        buy_px_usd: qa.px_ask_unit.map(|p| p * size_a),
+        sell_px_usd: qb.px_bid_unit.map(|p| p * size_b),
         size_buy: qa.size_ask,
         size_sell: qb.size_bid,
         lead_buy_ms: qa.since_iv_change_ms(now),
@@ -348,6 +438,9 @@ fn eval_dir(
         drift_sell_vp_1m: qb.drift_vp(60_000),
         spot,
         updated_ms: now.max(qa.recv_ms).max(qb.recv_ms),
+        expiry_ms,
+        quote_age_ms: (now - qa.recv_ms.min(qb.recv_ms)).max(0) as f64,
+        depth_units: max_units,
     })
 }
 
