@@ -1,0 +1,23 @@
+[package]
+name = "ivarb-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ivarb-protocol = { path = "../protocol" }
+ivarb-quant = { path = "../quant" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "net"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "http2"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rustc-hash = "2"
+smallvec = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rand = "0.8"
+tracing = "0.1"
+thiserror = "2"
+arc-swap = "1"
+anyhow = "1"

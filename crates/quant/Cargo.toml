@@ -1,0 +1,6 @@
+[package]
+name = "ivarb-quant"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

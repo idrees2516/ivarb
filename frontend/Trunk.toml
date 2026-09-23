@@ -1,0 +1,7 @@
+[build]
+dist = "dist"
+release = true
+
+[[build.wasm_opt]]
+# Skip the slow binaryen pass — size is acceptable without it.
+disabled = true

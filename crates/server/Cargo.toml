@@ -1,0 +1,23 @@
+[package]
+name = "ivarb-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ivarb-server"
+path = "src/main.rs"
+
+[dependencies]
+ivarb-engine = { path = "../engine" }
+ivarb-protocol = { path = "../protocol" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "net"] }
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+arc-swap = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+mimalloc = "0.1"
+anyhow = "1"
