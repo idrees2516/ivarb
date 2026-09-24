@@ -80,6 +80,31 @@ pub struct EngineConfig {
     /// Entry-gate multiplier for mark-mode (convergence-candidate) signals
     /// relative to the executable-edge gate.
     pub mark_gate_mult: f64,
+    // ---- millisecond pipeline & advanced analytics ----
+    /// WS delta push cadence (ms). Default 1 — the pipeline is millisecond-grade.
+    pub broadcast_ms: u64,
+    /// Housekeeping sweep cadence (ms).
+    pub sweep_ms: u64,
+    /// Full snapshot republish cadence (ms).
+    pub snapshot_ms: u64,
+    /// Multi-hop route scan cadence (ms).
+    pub multihop_ms: u64,
+    /// Hold-candidate refresh cadence (ms).
+    pub holds_ms: u64,
+    /// GA: ms per generation.
+    pub ga_gen_ms: u64,
+    /// GA: apply the best genome to live strategy parameters.
+    pub ga_apply: bool,
+    /// GA: enabled at all.
+    pub ga_enabled: bool,
+    /// OU/Kalman refit cadence for opportunity histories (ms).
+    pub ou_refit_ms: u64,
+    /// Executor cadences (ms): scan / monitor / push.
+    pub exec_scan_ms: u64,
+    pub exec_monitor_ms: u64,
+    pub exec_push_ms: u64,
+    /// Max underlying units considered per multi-hop leg (display cap).
+    pub multihop_max_units: f64,
 }
 
 impl Default for EngineConfig {
@@ -98,9 +123,9 @@ impl Default for EngineConfig {
             min_dte: 1,
             max_dte: 400,
             sim: SimMode::Auto,
-            broadcast_ms: 250,
-            sweep_ms: 1_000,
-            snapshot_ms: 30_000,
+            broadcast_ms: 1,
+            sweep_ms: 250,
+            snapshot_ms: 1_000,
             data_dir: "./data".into(),
             max_instruments_per_venue: 1_200,
             degraded_after_ms: 20_000,
@@ -110,6 +135,16 @@ impl Default for EngineConfig {
             min_vega_usd: 1.0,
             max_spread_vp: 25.0,
             mark_gate_mult: 1.5,
+            multihop_ms: 250,
+            holds_ms: 500,
+            ga_gen_ms: 15_000,
+            ga_apply: true,
+            ga_enabled: true,
+            ou_refit_ms: 2_000,
+            exec_scan_ms: 1,
+            exec_monitor_ms: 10,
+            exec_push_ms: 25,
+            multihop_max_units: 5.0,
         }
     }
 }
@@ -238,7 +273,37 @@ impl EngineConfig {
             cfg.retire_ms = v;
         }
         if let Some(v) = env_u64("IVARB_BROADCAST_MS") {
-            cfg.broadcast_ms = v.max(100);
+            cfg.broadcast_ms = v.clamp(1, 10_000);
+        }
+        if let Some(v) = env_u64("IVARB_SWEEP_MS") {
+            cfg.sweep_ms = v.clamp(10, 10_000);
+        }
+        if let Some(v) = env_u64("IVARB_SNAPSHOT_MS") {
+            cfg.snapshot_ms = v.clamp(50, 60_000);
+        }
+        if let Some(v) = env_u64("IVARB_MULTIHOP_MS") {
+            cfg.multihop_ms = v.clamp(50, 10_000);
+        }
+        if let Some(v) = env_u64("IVARB_HOLDS_MS") {
+            cfg.holds_ms = v.clamp(100, 10_000);
+        }
+        if let Some(v) = env_u64("IVARB_GA_GEN_MS") {
+            cfg.ga_gen_ms = v.clamp(1_000, 600_000);
+        }
+        if let Some(v) = env_str("IVARB_GA_APPLY") {
+            cfg.ga_apply = !matches!(v.to_lowercase().as_str(), "0" | "false" | "off" | "no");
+        }
+        if let Some(v) = env_str("IVARB_GA_ENABLED") {
+            cfg.ga_enabled = !matches!(v.to_lowercase().as_str(), "0" | "false" | "off" | "no");
+        }
+        if let Some(v) = env_u64("IVARB_EXEC_SCAN_MS") {
+            cfg.exec_scan_ms = v.clamp(1, 10_000);
+        }
+        if let Some(v) = env_u64("IVARB_EXEC_MONITOR_MS") {
+            cfg.exec_monitor_ms = v.clamp(5, 10_000);
+        }
+        if let Some(v) = env_u64("IVARB_EXEC_PUSH_MS") {
+            cfg.exec_push_ms = v.clamp(10, 10_000);
         }
         if let Some(v) = env_str("IVARB_UNDERLYINGS") {
             cfg.underlyings = v

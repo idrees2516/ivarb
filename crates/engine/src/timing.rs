@@ -186,6 +186,11 @@ pub struct SignalCtx {
     pub iv_mid_raw: f64,
     /// Configured base entry gate (vp), normally 0.5.
     pub base_gate_vp: f64,
+    /// Genome (GA) multipliers: entry gate, patience window, max hold.
+    /// 1.0 when no genome is applied.
+    pub ga_gate_mult: f64,
+    pub ga_patience_mult: f64,
+    pub ga_hold_mult: f64,
 }
 
 /// Compute the full time-aware strategy view for one signal.
@@ -205,10 +210,14 @@ pub fn evaluate(ctx: &SignalCtx, now_ms: i64) -> StrategyView {
         0.0
     };
 
-    // --- effective gate: bucket × regime × signal-age decay ----------------
+    // --- effective gate: bucket × regime × signal-age decay × genome -------
     let age_mult = 1.0
         + ((ctx.signal_age_ms / 60_000.0) / 12.0).min(1.0) * 0.15; // up to +15% over 12 min
-    let gate_vp = ctx.base_gate_vp * bucket.gate_mult() * regime.gate_mult * age_mult;
+    let gate_vp = ctx.base_gate_vp
+        * bucket.gate_mult()
+        * regime.gate_mult
+        * age_mult
+        * ctx.ga_gate_mult.max(0.2);
 
     // --- fill probability model ---------------------------------------------
     // Fresh, deep, executable quotes fill both legs; stale or thin ones leave
@@ -286,8 +295,8 @@ pub fn evaluate(ctx: &SignalCtx, now_ms: i64) -> StrategyView {
         gate_vp,
         ev_vp: ev_vp.max(-9.99),
         theta_vp_day,
-        patience_s: bucket.patience_s(),
-        hold_s: bucket.max_hold_s(),
+        patience_s: bucket.patience_s() * ctx.ga_patience_mult.max(0.1),
+        hold_s: bucket.max_hold_s() * ctx.ga_hold_mult.max(0.1),
         dte,
         conv_hint,
     }
@@ -312,6 +321,9 @@ mod tests {
             t_years: dte / 365.0,
             iv_mid_raw: 0.55,
             base_gate_vp: 0.5,
+            ga_gate_mult: 1.0,
+            ga_patience_mult: 1.0,
+            ga_hold_mult: 1.0,
         }
     }
 
@@ -344,6 +356,25 @@ mod tests {
         // Fully stale (beyond the 20 s passive window) → MONITOR only.
         c.quote_age_ms = 25_000.0;
         assert_eq!(evaluate(&c, 0).tier, Tier::Monitor);
+    }
+
+    #[test]
+    fn genome_multiplier_scales_gate_and_windows() {
+        let mut c = ctx(2.0, 20.0);
+        c.ga_gate_mult = 1.8;
+        c.ga_patience_mult = 2.0;
+        c.ga_hold_mult = 0.5;
+        let s = evaluate(&c, 0);
+        let base = evaluate(&ctx(2.0, 20.0), 0);
+        assert!((s.gate_vp / base.gate_vp - 1.8).abs() < 1e-9);
+        assert!((s.patience_s / base.patience_s - 2.0).abs() < 1e-9);
+        assert!((s.hold_s / base.hold_s - 0.5).abs() < 1e-9);
+        // A 1.8× gate blocks what the default gate admits.
+        let mid = ctx(1.0, 20.0);
+        assert_eq!(evaluate(&mid, 0).tier, Tier::Sniper);
+        let mut strict = mid;
+        strict.ga_gate_mult = 3.0;
+        assert_ne!(evaluate(&strict, 0).tier, Tier::Sniper);
     }
 
     #[test]

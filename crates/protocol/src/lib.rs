@@ -402,6 +402,172 @@ pub enum ExecCommand {
 
 pub type HistoryPt = (i64, f64);
 
+// ---------------------------------------------------------------------------
+// Hold-to-expiry analytics ("too thin to arb — what if I just keep it?")
+// ---------------------------------------------------------------------------
+
+/// Compact hold-to-expiry stats attached to every opportunity (closed-form
+/// only; the full Monte-Carlo view is served on demand by `/api/hold`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct HoldStats {
+    /// EV per buy-venue contract of keeping the cheap leg to expiry, USD.
+    pub ev_usd: f64,
+    /// Theta today per contract, USD/day (negative).
+    pub theta_day_usd: f64,
+    /// Extrinsic per contract — the maximum quiet-case bleed, USD.
+    pub extrinsic_usd: f64,
+    /// P(terminal P&L > 0) under the consensus forecast, 0..1.
+    pub p_profit: f64,
+    /// forecast_vp − implied ask vp on the cheap leg.
+    pub iv_edge_vp: f64,
+    /// Days to expiry.
+    pub dte: f64,
+}
+
+/// A near-miss pair: the premium spread exists but fees make the *arb*
+/// unprofitable — surfaced so the hold-to-expiry lab can evaluate keeping the
+/// cheap leg as an outright long-vol position instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HoldCandidate {
+    /// Canonical instrument id (`UND-yyyymmdd-strike-R`).
+    pub inst_id: String,
+    pub underlying: String,
+    pub expiry: String,
+    pub strike: f64,
+    pub right: Right,
+    /// Venue with the cheap ask.
+    pub venue: VenueId,
+    /// Premium per 1 underlying unit on the cheap venue.
+    pub ask_px_unit: f64,
+    /// Cross-venue consensus mark IV (vp) — the default vol forecast.
+    pub consensus_iv_vp: f64,
+    /// IV implied by the ask (vp).
+    pub implied_iv_vp: f64,
+    /// Buy-venue taker fee rate (fraction of underlying).
+    pub fee_rate: f64,
+    pub spot: f64,
+    pub t_years: f64,
+    /// Underlying units per contract on the cheap venue.
+    pub contract_size: f64,
+    /// The arb view for contrast: spread vp, fee vp, net vp (negative/thin).
+    pub arb_spread_vp: f64,
+    pub arb_fee_vp: f64,
+    pub arb_net_vp: f64,
+    pub vega_vp_usd: f64,
+    /// Closed-form hold stats under the consensus forecast.
+    pub hold: HoldStats,
+    pub updated_ms: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Multi-hop arbitrage routes
+// ---------------------------------------------------------------------------
+
+/// One executable step of a multi-hop route.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MultiHopLeg {
+    /// buy | sell | convert (call↔put on the same venue via parity).
+    pub action: String,
+    pub venue: VenueId,
+    /// Display instrument (venue-agnostic canonical name).
+    pub instrument: String,
+    /// Premium per unit that this leg pays (+) or receives (−), USD.
+    pub px_unit: f64,
+    /// Fee per unit, USD.
+    pub fee_unit: f64,
+    /// Executable size in underlying units.
+    pub size_units: f64,
+}
+
+/// A detected cross-venue / parity-conversion route whose round-trip cash
+/// flow is positive after every fee — found by negative-cycle search over the
+/// (venue × right) graph per strike family.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MultiHopRoute {
+    pub id: String,
+    pub underlying: String,
+    pub expiry: String,
+    pub strike: f64,
+    /// Route hops, e.g. buy call on okx → convert to put on deribit → sell put
+    /// on bybit.
+    pub legs: Vec<MultiHopLeg>,
+    /// Total USD profit per 1 underlying unit after all fees.
+    pub profit_unit_usd: f64,
+    /// Profit in vol points on the family vega.
+    pub profit_vp: f64,
+    /// Executable size in underlying units (min across legs).
+    pub size_units: f64,
+    /// Total profit at the executable size, USD.
+    pub total_usd: f64,
+    /// Max quote age across the legs, ms.
+    pub max_age_ms: i64,
+    pub updated_ms: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Genetic-algorithm strategy optimizer
+// ---------------------------------------------------------------------------
+
+/// One gene of the evolved strategy genome.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GaGene {
+    /// Stable gene key (e.g. `entry_gate_mult`).
+    pub key: String,
+    /// Human label.
+    pub label: String,
+    /// Current value.
+    pub value: f64,
+    /// Search bounds.
+    pub lo: f64,
+    pub hi: f64,
+    /// Hand-tuned default (generation 0 baseline).
+    pub default: f64,
+}
+
+/// Live status of the genetic optimizer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GaStatus {
+    pub t_ms: i64,
+    pub generation: u32,
+    /// Whether evolution is running.
+    pub running: bool,
+    /// Whether the best genome is applied to live strategy parameters.
+    pub applied: bool,
+    /// Fitness of the best genome (risk-adjusted vp per 100 episodes).
+    pub best_fitness: f64,
+    /// Fitness of the hand-tuned default genome on the same tape.
+    pub default_fitness: f64,
+    /// Improvement of best over default, percent.
+    pub improvement_pct: f64,
+    /// Best-genome genes (ordered).
+    pub genes: Vec<GaGene>,
+    /// Best fitness per generation (recent tail).
+    pub history: Vec<f64>,
+    /// Episodes currently in the tape.
+    pub tape_episodes: u32,
+    /// Simulated trades in the last replay.
+    pub replay_trades: u32,
+    /// Replay P&L of the best genome, vp.
+    pub replay_pnl_vp: f64,
+    /// Replay max drawdown of the best genome, vp.
+    pub replay_max_dd_vp: f64,
+    /// Milliseconds per generation.
+    pub gen_ms: u64,
+}
+
+/// Commands for the genetic optimizer (REST → GA thread).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GaCommand {
+    Pause,
+    Resume,
+    /// Apply / un-apply the best genome to live strategy parameters.
+    SetApplied { applied: bool },
+    /// Re-seed the population from defaults.
+    Reset,
+    SetGenMs { ms: u64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VenueStatus {
     pub venue: VenueId,
@@ -417,6 +583,9 @@ pub struct VenueStatus {
     pub coin_margined: bool,
     /// Underlying units per contract (indicative where venue does not publish).
     pub contract_size: f64,
+    /// EWMA of venue-timestamp vs local-arrival lag, ms (feed delay).
+    #[serde(default)]
+    pub lag_ms_ewma: f64,
     pub note: Option<String>,
 }
 
@@ -510,6 +679,19 @@ pub struct Opportunity {
     /// Convergence hint from IV drift: true when the rich leg is fading
     /// toward the cheap leg (favorable for our position).
     pub conv_hint: bool,
+    /// OU half-life of the spread (seconds) — expected convergence time.
+    #[serde(default)]
+    pub conv_eta_s: Option<f64>,
+    /// Kalman-filtered spread level (vp) and innovation σ (vp) — the noise
+    /// gate used by the adaptive take-profit exit.
+    #[serde(default)]
+    pub kalman_level_vp: Option<f64>,
+    #[serde(default)]
+    pub kalman_sigma_vp: Option<f64>,
+    /// Hold-to-expiry view of the cheap leg (the "arb is too thin, keep the
+    /// option" alternative), computed under the cross-venue consensus IV.
+    #[serde(default)]
+    pub hold: Option<HoldStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -525,6 +707,34 @@ pub struct EngineStats {
     pub engine_loop_us_ewma: f64,
     pub msgs_total: u64,
     pub msg_rate: f64,
+    // ---- millisecond-pipeline telemetry ----
+    /// Quote-arrival → signal-computed latency percentiles, µs.
+    #[serde(default)]
+    pub pipe_p50_us: f64,
+    #[serde(default)]
+    pub pipe_p99_us: f64,
+    #[serde(default)]
+    pub pipe_p999_us: f64,
+    /// Signal → serialized WS frame latency percentiles, µs.
+    #[serde(default)]
+    pub wire_p50_us: f64,
+    #[serde(default)]
+    pub wire_p99_us: f64,
+    /// Broadcast (delta push) cadence, ms.
+    #[serde(default)]
+    pub broadcast_ms: u64,
+    /// Sweep (housekeeping) cadence, ms.
+    #[serde(default)]
+    pub sweep_ms: u64,
+    /// Live multi-hop routes.
+    #[serde(default)]
+    pub multihop_routes: u32,
+    /// Hold-to-expiry candidates currently tracked.
+    #[serde(default)]
+    pub holds_tracked: u32,
+    /// GA generation of the applied genome (0 = defaults).
+    #[serde(default)]
+    pub ga_generation: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -535,6 +745,12 @@ pub struct Snapshot {
     /// Consensus spot per underlying.
     pub spots: Vec<SpotQuote>,
     pub opportunities: Vec<Opportunity>,
+    /// Near-miss pairs feeding the hold-to-expiry lab.
+    #[serde(default)]
+    pub holds: Vec<HoldCandidate>,
+    /// Live multi-hop routes.
+    #[serde(default)]
+    pub multihop: Vec<MultiHopRoute>,
 }
 
 /// Server → client messages, tagged JSON.
@@ -549,6 +765,12 @@ pub enum ServerMsg {
     Spots { items: Vec<SpotQuote> },
     /// Advantage-taker state (positions, trades, log, settings).
     Exec { exec: ExecSnapshot },
+    /// Hold-to-expiry near-miss candidates.
+    Holds { items: Vec<HoldCandidate> },
+    /// Multi-hop arbitrage routes.
+    Multihop { items: Vec<MultiHopRoute> },
+    /// Genetic-optimizer status.
+    Ga { status: GaStatus },
 }
 
 /// Client → server messages.

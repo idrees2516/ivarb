@@ -21,13 +21,18 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use ivarb_protocol::{
-    ConnState, EdgeMode, EngineStats, FeedMode, HistoryPt, Opportunity, ServerMsg, Snapshot,
-    SpotQuote, VenueId, VenueStatus, WatchedLeg,
+    ConnState, EdgeMode, EngineStats, FeedMode, HistoryPt, MultiHopRoute, Opportunity,
+    ServerMsg, Snapshot, SpotQuote, VenueId, VenueStatus, WatchedLeg,
 };
 
 use crate::config::{EngineConfig, VenueSpec};
+use crate::ga::{GaHandle, GaShared, GenomeView, TapeEvent};
+use crate::hold::HoldTracker;
 use crate::key::{t_years, ymd_to_expiry_ms, InstKey, UnderlyingInterner};
 use crate::msg::{now_ms, InstrTick, VenueMsg};
+use crate::multihop::{self, MultihopParams};
+use crate::ou;
+use crate::perf::LatencyHist;
 use crate::strategy::{derive_ivs, evaluate_pair, LegQuote, OppCore};
 
 const MAX_BURST: usize = 2_048;
@@ -45,6 +50,11 @@ pub struct EngineHandles {
     pub watch_tx: mpsc::UnboundedSender<WatchCmd>,
     /// Engine → advantage-taker: live quotes for watched instruments.
     pub watched: Arc<ArcSwap<FxHashMap<String, Vec<WatchedLeg>>>>,
+    /// Genetic-optimizer handle (status, commands, tape input).
+    pub ga: GaHandle,
+    /// Millisecond-fresh opportunity list for the executor's 1 ms scan loop
+    /// (cheaper than republishing full snapshots).
+    pub opps_light: Arc<ArcSwap<Arc<Vec<Opportunity>>>>,
 }
 
 /// Replace the executor's watched-instrument set (canonical ids like
@@ -63,6 +73,8 @@ struct VenueRt {
     msg_window: VecDeque<i64>,
     last_msg_ms: i64,
     fatal: bool,
+    /// EWMA of venue-timestamp vs arrival lag (ms).
+    lag_ms_ewma: f64,
 }
 
 struct OppState {
@@ -70,6 +82,11 @@ struct OppState {
     hist: VecDeque<HistoryPt>,
     last_hist_ms: i64,
     last_log_ms: i64,
+    last_ou_ms: i64,
+    last_hold_ms: i64,
+    last_tape_ms: i64,
+    /// Kalman filter state for the spread level.
+    kalman: ou::Kalman1,
 }
 
 pub struct Engine {
@@ -95,6 +112,27 @@ pub struct Engine {
     opps: FxHashMap<String, OppState>,
     dirty: FxHashSet<String>,
     retire_now: Vec<String>,
+    /// Millisecond-fresh opportunity cache published for the executor.
+    opps_cache: FxHashMap<String, Opportunity>,
+    opps_light: Arc<ArcSwap<Arc<Vec<Opportunity>>>>,
+
+    // ---- advanced analytics ----
+    /// Near-miss (below-gate) candidates for the hold-to-expiry lab.
+    holds: HoldTracker,
+    /// Live multi-hop routes.
+    multihop: Vec<MultiHopRoute>,
+    /// Families (strike heads) touched since the last analytics pass.
+    family_dirty: FxHashSet<InstKey>,
+    /// Genome view refreshed once per second (engine-side gates etc.).
+    ga_view: GenomeView,
+    ga: GaHandle,
+    _ga_shared: Arc<ArcSwap<GaShared>>,
+    /// OU refit bookkeeping.
+    ou_tick_ms: i64,
+
+    // ---- latency telemetry ----
+    pipe_hist: LatencyHist,
+    wire_hist: LatencyHist,
 
     started: Instant,
     msgs_total: AtomicU64,
@@ -140,6 +178,7 @@ impl Engine {
         interner: Arc<std::sync::Mutex<UnderlyingInterner>>,
         watch_rx: mpsc::UnboundedReceiver<WatchCmd>,
         watched_out: Arc<ArcSwap<FxHashMap<String, Vec<WatchedLeg>>>>,
+        ga: GaHandle,
     ) -> Self {
         let mut venues = FxHashMap::default();
         for spec in &cfg.venues {
@@ -157,6 +196,7 @@ impl Engine {
                 taker_fee_rate: spec.taker_fee_rate,
                 coin_margined: spec.coin_margined,
                 contract_size: spec.contract_size,
+                lag_ms_ewma: 0.0,
                 note: if spec.enabled {
                     None
                 } else {
@@ -174,9 +214,12 @@ impl Engine {
                     msg_window: VecDeque::new(),
                     last_msg_ms: 0,
                     fatal: false,
+                    lag_ms_ewma: 0.0,
                 },
             );
         }
+        let ga_view = GenomeView::from_shared(&ga.shared, &ga.applied);
+        let _ga_shared = ga.shared.clone();
         Self {
             cfg,
             rx,
@@ -196,6 +239,17 @@ impl Engine {
             opps: FxHashMap::default(),
             dirty: FxHashSet::default(),
             retire_now: Vec::new(),
+            opps_cache: FxHashMap::default(),
+            opps_light: Arc::new(ArcSwap::from_pointee(Arc::new(Vec::new()))),
+            holds: HoldTracker::new(),
+            multihop: Vec::new(),
+            family_dirty: FxHashSet::default(),
+            ga_view,
+            ga,
+            _ga_shared,
+            ou_tick_ms: 0,
+            pipe_hist: LatencyHist::new(),
+            wire_hist: LatencyHist::new(),
             started: Instant::now(),
             msgs_total: AtomicU64::new(0),
             loop_us_ewma: 0.0,
@@ -210,8 +264,12 @@ impl Engine {
         let mut flush = tokio::time::interval(Duration::from_millis(self.cfg.broadcast_ms));
         let mut sweep = tokio::time::interval(Duration::from_millis(self.cfg.sweep_ms));
         let mut snap_tick = tokio::time::interval(Duration::from_millis(self.cfg.snapshot_ms));
+        let mut mh_tick = tokio::time::interval(Duration::from_millis(self.cfg.multihop_ms));
+        let mut ga_tick = tokio::time::interval(Duration::from_secs(1));
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        mh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ga_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -223,6 +281,7 @@ impl Engine {
                             self.drain_burst();
                             let us = t0.elapsed().as_micros() as f64;
                             self.loop_us_ewma = if self.loop_us_ewma == 0.0 { us } else { self.loop_us_ewma * 0.98 + us * 0.02 };
+                            self.pipe_hist.record_us(us);
                         }
                         None => break,
                     }
@@ -230,6 +289,11 @@ impl Engine {
                 Some(cmd) = self.watch_rx.recv() => self.handle_watch(cmd),
                 _ = flush.tick() => self.flush_dirty(),
                 _ = sweep.tick() => self.housekeeping(),
+                _ = mh_tick.tick() => self.analytics_pass(),
+                _ = ga_tick.tick() => {
+                    self.ga_view = GenomeView::from_shared(&self.ga.shared, &self.ga.applied);
+                    self.holds.set_ev_gate(self.ga_view.hold_ev_gate_usd());
+                }
                 _ = snap_tick.tick() => {
                     self.publish_snapshot();
                     self.broadcast(ServerMsg::Stats { stats: self.stats() });
@@ -272,6 +336,7 @@ impl Engine {
                                 taker_fee_rate: spec.taker_fee_rate,
                                 coin_margined: spec.coin_margined,
                                 contract_size: spec.contract_size,
+                                lag_ms_ewma: 0.0,
                                 note: if is_sim {
                                     Some("simulated feed".into())
                                 } else {
@@ -285,6 +350,7 @@ impl Engine {
                             msg_window: VecDeque::new(),
                             last_msg_ms: 0,
                             fatal: false,
+                            lag_ms_ewma: 0.0,
                         },
                     );
                     self.bcast_venues();

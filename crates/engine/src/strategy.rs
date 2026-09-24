@@ -7,6 +7,7 @@ use ivarb_protocol::{EdgeMode, Opportunity, Right as PRight};
 use ivarb_quant::{bs_price, bs_vega, fee_vp, vega_per_vp, Right};
 
 use crate::config::{EngineConfig, VenueSpec};
+use crate::ga::GenomeView;
 use crate::key::{iso_from_ymd, t_years, InstKey};
 use crate::msg::InstrTick;
 use crate::timing::{self, SignalCtx, StrategyView};
@@ -166,6 +167,11 @@ fn to_qright(r: u8) -> Right {
     }
 }
 
+/// Public alias used by the hold tracker and multihop scanner.
+pub fn qright(r: u8) -> Right {
+    to_qright(r)
+}
+
 pub struct OppCore {
     pub id: String,
     pub key: InstKey,
@@ -252,18 +258,24 @@ impl OppCore {
             patience_s: 0.0,
             hold_s: 0.0,
             conv_hint: false,
+            conv_eta_s: None,
+            kalman_level_vp: None,
+            kalman_sigma_vp: None,
+            hold: None,
         }
     }
 
     /// Time-aware strategy view for this core; used by the engine to stamp
     /// tier/gate/EV fields on the opportunity.
-    pub fn strategy_view(
+    pub fn strategy_view_ga(
         &self,
         cfg: &EngineConfig,
         signal_age_ms: f64,
         now_ms: i64,
+        ga: &GenomeView,
     ) -> StrategyView {
         let iv_mid_raw = ((self.iv_buy_vp + self.iv_sell_vp) * 0.5 / 100.0).max(1e-3);
+        let hour = ((now_ms / 3_600_000).rem_euclid(24)) as f64;
         timing::evaluate(
             &SignalCtx {
                 net_vp: self.net_vp,
@@ -279,9 +291,22 @@ impl OppCore {
                 t_years: t_years(now_ms, self.expiry_ms),
                 iv_mid_raw,
                 base_gate_vp: cfg.min_net_vp,
+                ga_gate_mult: ga.gate_mult(hour),
+                ga_patience_mult: ga.patience_mult(),
+                ga_hold_mult: ga.hold_mult(),
             },
             now_ms,
         )
+    }
+
+    /// Back-compat view without genome adjustments.
+    pub fn strategy_view(
+        &self,
+        cfg: &EngineConfig,
+        signal_age_ms: f64,
+        now_ms: i64,
+    ) -> StrategyView {
+        self.strategy_view_ga(cfg, signal_age_ms, now_ms, &GenomeView::default())
     }
 }
 

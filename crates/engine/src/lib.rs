@@ -5,9 +5,14 @@
 
 pub mod config;
 pub mod engine;
+pub mod ga;
+pub mod hold;
 pub mod jsonutil;
 pub mod key;
 pub mod msg;
+pub mod multihop;
+pub mod ou;
+pub mod perf;
 pub mod strategy;
 pub mod timing;
 pub mod venues;
@@ -23,6 +28,7 @@ use ivarb_protocol::Snapshot;
 
 pub use config::{EngineConfig, SimMode, VenueKind, VenueSpec};
 pub use engine::EngineHandles;
+pub use ga::GaHandle;
 pub use venues::VenueConnector;
 
 /// Boot the engine. Returns handles shared with the HTTP/WS server.
@@ -81,6 +87,43 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
     let spots_shared: Arc<ArcSwap<FxHashMap<String, f64>>> =
         Arc::new(ArcSwap::from_pointee(FxHashMap::default()));
 
+    // Genetic-algorithm strategy optimizer (own OS thread; owns the tape).
+    let ga = if cfg.ga_enabled {
+        ga::spawn_ga(cfg.ga_gen_ms, cfg.ga_apply)
+    } else {
+        // Still provide the channel endpoints so the engine code is uniform.
+        let (tape_tx, tape_rx) = crossbeam_channel::unbounded();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        drop(tape_rx);
+        drop(cmd_rx);
+        let shared = Arc::new(ArcSwap::from_pointee(ga::GaShared {
+            status: ivarb_protocol::GaStatus {
+                t_ms: crate::msg::now_ms(),
+                generation: 0,
+                running: false,
+                applied: false,
+                best_fitness: 0.0,
+                default_fitness: 0.0,
+                improvement_pct: 0.0,
+                genes: ga::genome_genes(&ga::default_genome()),
+                history: Vec::new(),
+                tape_episodes: 0,
+                replay_trades: 0,
+                replay_pnl_vp: 0.0,
+                replay_max_dd_vp: 0.0,
+                gen_ms: cfg.ga_gen_ms,
+            },
+            genome: ga::default_genome(),
+        }));
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ga::GaHandle {
+            shared,
+            cmd_tx,
+            tape_tx,
+            applied,
+        }
+    };
+
     // Pre-intern the configured underlyings so ids are deterministic.
     if let Ok(mut i) = interner.lock() {
         for u in &cfg.underlyings {
@@ -105,6 +148,7 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
         interner.clone(),
         watch_rx,
         watched.clone(),
+        ga.clone(),
     )
     .run());
 
@@ -187,5 +231,6 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
         spots_shared,
         watch_tx,
         watched,
+        ga,
     })
 }
