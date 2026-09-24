@@ -62,6 +62,10 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
             multihop_routes: 0,
             holds_tracked: 0,
             ga_generation: 0,
+            min_net_vp: cfg.min_net_vp,
+            exit_net_vp: cfg.exit_net_vp,
+            moneyness_pct: cfg.signal_moneyness_pct,
+            min_vega_usd: cfg.min_vega_usd,
         },
         venues: cfg
             .venues

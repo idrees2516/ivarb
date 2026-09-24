@@ -109,8 +109,13 @@ impl Default for EngineConfig {
         Self {
             venues: default_venues(),
             underlyings: vec!["BTC".into(), "ETH".into(), "SOL".into()],
-            min_net_vp: 0.5,
-            exit_net_vp: 0.25,
+            // Tuned 2026-09-24 (see README "Tuning" table):
+            // 0.5 vp (spec default) clears fees (~0.04 vp) but not quote
+            // noise (Kalman σ ≈ 0.2-0.4 vp) + taker slippage; 0.75 keeps
+            // ~2σ of headroom. Override with IVARB_MIN_NET_VP.
+            min_net_vp: 0.75,
+            // Hysteresis: retire at roughly half the entry gate.
+            exit_net_vp: 0.35,
             stale_ms: 45_000,
             retire_ms: 180_000,
             history_len: 240,
@@ -128,8 +133,13 @@ impl Default for EngineConfig {
             degraded_after_ms: 20_000,
             iv_min_vp: 15.0,
             iv_max_vp: 250.0,
-            signal_moneyness_pct: 0.12,
-            min_vega_usd: 1.0,
+            // Hard cap on the dynamic (1.5σ·√t) moneyness band. 12% admitted
+            // low-vega wing quotes at long tenors; 10% trims them. Override
+            // with IVARB_SIGNAL_MONEYNESS_PCT.
+            signal_moneyness_pct: 0.10,
+            // $1/vp legs are display noise even at 30d; $2 keeps the scanner
+            // and the taker on tradable vega. Override with IVARB_MIN_VEGA_USD.
+            min_vega_usd: 2.0,
             max_spread_vp: 25.0,
             mark_gate_mult: 1.5,
             multihop_ms: 250,
@@ -258,10 +268,32 @@ impl EngineConfig {
         let mut cfg = Self::default();
 
         if let Some(v) = env_f64("IVARB_MIN_NET_VP") {
-            cfg.min_net_vp = v;
+            cfg.min_net_vp = v.clamp(0.05, 25.0);
         }
         if let Some(v) = env_f64("IVARB_EXIT_VP") {
-            cfg.exit_net_vp = v;
+            cfg.exit_net_vp = v.clamp(0.01, 20.0);
+        }
+        // ---- sanity-filter knobs (tunable without recompiling) ----
+        if let Some(v) = env_f64("IVARB_SIGNAL_MONEYNESS_PCT") {
+            cfg.signal_moneyness_pct = v.clamp(0.01, 0.5);
+        }
+        if let Some(v) = env_f64("IVARB_ATM_PCT") {
+            cfg.atm_pct = v.clamp(0.01, 1.0);
+        }
+        if let Some(v) = env_f64("IVARB_MIN_VEGA_USD") {
+            cfg.min_vega_usd = v.clamp(0.5, 500.0);
+        }
+        if let Some(v) = env_f64("IVARB_IV_MIN_VP") {
+            cfg.iv_min_vp = v.clamp(1.0, 100.0);
+        }
+        if let Some(v) = env_f64("IVARB_IV_MAX_VP") {
+            cfg.iv_max_vp = v.clamp(50.0, 900.0);
+        }
+        if let Some(v) = env_f64("IVARB_MAX_SPREAD_VP") {
+            cfg.max_spread_vp = v.clamp(2.0, 200.0);
+        }
+        if let Some(v) = env_f64("IVARB_MARK_GATE_MULT") {
+            cfg.mark_gate_mult = v.clamp(1.0, 10.0);
         }
         if let Some(v) = env_i64_or("IVARB_STALE_MS") {
             cfg.stale_ms = v;

@@ -65,6 +65,27 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // `ivarb-server --live-preflight`: validate the authenticated Deribit
+    // path (env gates + credentials + account) and exit — no engine, no
+    // orders. Zero-risk way to check keys before arming live mode.
+    if std::env::args().any(|a| a == "--live-preflight") {
+        println!("IVARB live preflight — checking the authenticated Deribit path…\n");
+        let checks = ivarb_executor::live::live_preflight().await;
+        let mut all_ok = true;
+        for c in &checks {
+            println!("  [{}] {}", if c.ok { " OK " } else { "FAIL" }, c.line());
+            if !c.ok {
+                all_ok = false;
+            }
+        }
+        println!(
+            "\n{} — set IVARB_MODE=live + DERIBIT_API_KEY/SECRET + IVARB_LIVE_CONFIRM=yes to arm; \
+             DERIBIT_WS_URL=wss://test.deribit.com/ws/api/v2 rehearses on testnet.",
+            if all_ok { "PREFLIGHT PASSED" } else { "PREFLIGHT FAILED" }
+        );
+        std::process::exit(if all_ok { 0 } else { 1 });
+    }
+
     let cfg = EngineConfig::from_env();
     std::fs::create_dir_all(&cfg.data_dir)?;
     let data_dir = cfg.data_dir.clone();

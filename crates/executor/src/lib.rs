@@ -29,8 +29,8 @@ use ivarb_engine::engine::WatchCmd;
 use ivarb_engine::timing::Regime;
 use ivarb_protocol::{
     ExecCommand, ExecEvent, ExecLevel, ExecMode, ExecSettings, ExecSnapshot, ExecStats,
-    ExitReason, Opportunity, Position, PositionEntry, PositionMtm, Right, Snapshot, TimeRegime,
-    Trade, WatchedLeg,
+    ExitReason, LiveStatus, Opportunity, Position, PositionEntry, PositionMtm, Right, Snapshot,
+    TimeRegime, Trade, WatchedLeg,
 };
 
 use machine::{AttemptCtx, AttemptOutcome, PositionDraft};
@@ -79,7 +79,17 @@ struct Core {
     attempt_rx: mpsc::Receiver<(u64, AttemptOutcome)>,
     event_tx: mpsc::UnboundedSender<ExecEvent>,
     event_rx: mpsc::UnboundedReceiver<ExecEvent>,
+    live_tx: mpsc::UnboundedSender<LiveMsg>,
+    live_rx: mpsc::UnboundedReceiver<LiveMsg>,
     broker: Arc<PaperBroker>,
+    /// Authenticated Deribit session, once the arming chain completes.
+    deribit: Option<Arc<live::DeribitSession>>,
+    /// Live-gateway readiness published to the UI.
+    live: LiveStatus,
+    /// Env-gate blockers captured at boot (why we are in paper mode).
+    arming_blockers: Vec<String>,
+    /// Emits the "routes refused" warning once, not every scan.
+    route_warned: bool,
     settings: ExecSettings,
     armed: bool,
     kill: Option<String>,
@@ -97,6 +107,13 @@ struct Core {
     dirty: bool,
 }
 
+/// Asynchronous live-path results delivered back into the single-writer core.
+enum LiveMsg {
+    Connected(Arc<live::DeribitSession>),
+    Failed(String),
+    Preflight(Vec<live::LiveCheck>),
+}
+
 /// Boot the advantage taker.
 pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ExecCommand>();
@@ -110,7 +127,19 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
         .iter()
         .map(|v| v.venue.clone())
         .collect();
-    let (mode, _keys) = live::live_mode_from_env();
+    let (live_tx, live_rx) = mpsc::unbounded_channel::<LiveMsg>();
+
+    // ---- live arming chain (IVARB_MODE + keys + explicit confirm) ----
+    let arming = live::live_arming_from_env();
+    let mode = arming.mode();
+    let arming_blockers = arming.blockers();
+    let live_status = LiveStatus {
+        requested: arming.requested,
+        keys_present: arming.keys.is_some(),
+        confirmed: arming.confirmed,
+        ws_url: arming.ws_url.clone(),
+        ..Default::default()
+    };
 
     let out = Arc::new(ArcSwap::from_pointee(empty_snapshot(mode)));
 
@@ -146,7 +175,56 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
         attempt_rx,
         event_tx,
         event_rx,
+        live_tx: live_tx.clone(),
+        live_rx,
+        deribit: None,
+        live: live_status,
+        arming_blockers,
+        route_warned: false,
     };
+
+    // ---- boot banner + (optional) live session connect ----
+    if arming.fully_armed() {
+        core.ev(
+            None,
+            ExecLevel::Warn,
+            "live",
+            format!(
+                "LIVE ARMING GATES OK — connecting Deribit session at {}",
+                arming.ws_url
+            ),
+        );
+        let (k, s) = arming.keys.clone().unwrap();
+        let ws = arming.ws_url.clone();
+        let tx = live_tx.clone();
+        tokio::spawn(async move {
+            match live::DeribitSession::connect_ws(&ws, &k, &s).await {
+                Ok(sess) => {
+                    let _ = tx.send(LiveMsg::Connected(sess));
+                }
+                Err(e) => {
+                    let _ = tx.send(LiveMsg::Failed(e.to_string()));
+                }
+            }
+        });
+    } else if arming.requested {
+        core.ev(
+            None,
+            ExecLevel::Error,
+            "live",
+            format!(
+                "live requested but NOT armed — {}",
+                arming.blockers().join(" · ")
+            ),
+        );
+    } else {
+        core.ev(
+            None,
+            ExecLevel::Info,
+            "live",
+            "paper mode (simulated fills) — going live needs IVARB_MODE=live + DERIBIT_API_KEY/SECRET + IVARB_LIVE_CONFIRM=yes; run LIVE PREFLIGHT anytime to check".into(),
+        );
+    }
 
     tokio::spawn(async move {
         let mut scan = tokio::time::interval(Duration::from_millis(250));
@@ -173,6 +251,11 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
                         core.events.push_back(e);
                         while core.events.len() > 240 { core.events.pop_front(); }
                         core.dirty = true;
+                    }
+                }
+                lm = core.live_rx.recv() => {
+                    if let Some(m) = lm {
+                        core.handle_live_msg(m);
                     }
                 }
                 _ = scan.tick() => core.scan(),
@@ -226,6 +309,7 @@ fn empty_snapshot(mode: ExecMode) -> ExecSnapshot {
         trades: Vec::new(),
         events: Vec::new(),
         balances: Vec::new(),
+        live: LiveStatus::default(),
     }
 }
 
@@ -283,6 +367,17 @@ impl Core {
                 }
                 self.ev(None, ExecLevel::Error, "control", "FLATTEN ALL — closing every open position at market".into());
             }
+            ExecCommand::LivePreflight => {
+                self.ev(None, ExecLevel::Info, "live", "preflight: checking arming gates, Deribit credentials and account…".into());
+                let tx = self.live_tx.clone();
+                tokio::spawn(async move {
+                    let checks = live::live_preflight().await;
+                    let _ = tx.send(LiveMsg::Preflight(checks));
+                });
+            }
+            ExecCommand::LiveSmokeTest { instrument } => {
+                self.live_smoke_test(instrument);
+            }
         }
         self.dirty = true;
     }
@@ -302,10 +397,203 @@ impl Core {
     }
 
     // ------------------------------------------------------------------
+    // live path (authenticated Deribit scaffold)
+    // ------------------------------------------------------------------
+
+    /// Venues with an authenticated order gateway (Deribit today).
+    fn live_gateways(&self) -> u32 {
+        if self.deribit.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Two-leg routes are only executable live when BOTH legs sit behind a
+    /// live gateway. A simulated leg inside a live attempt is forbidden, so
+    /// with a single gateway the taker refuses cross-venue routes rather
+    /// than presenting a half-real position as an arb.
+    fn route_ready(&self) -> bool {
+        if !matches!(self.mode, ExecMode::Live) {
+            return true;
+        }
+        self.live_gateways() >= 2
+    }
+
+    fn live_route_ok(&self, opp: &Opportunity) -> Result<(), String> {
+        if !matches!(self.mode, ExecMode::Live) {
+            return Ok(());
+        }
+        let deribit_up = self.deribit.is_some();
+        let ok = |v: &str| deribit_up && v == "deribit";
+        let (b, s) = (ok(&opp.buy_venue), ok(&opp.sell_venue));
+        if b && s {
+            Ok(())
+        } else {
+            Err(format!(
+                "live route incomplete — buy venue {} {}, sell venue {} {}; a paper leg inside a live attempt is forbidden (a second venue gateway completes the route)",
+                opp.buy_venue,
+                if b { "LIVE" } else { "no gateway" },
+                opp.sell_venue,
+                if s { "LIVE" } else { "no gateway" },
+            ))
+        }
+    }
+
+    fn handle_live_msg(&mut self, m: LiveMsg) {
+        match m {
+            LiveMsg::Connected(sess) => {
+                self.deribit = Some(sess);
+                self.live.session_up = true;
+                self.route_warned = false;
+                self.ev(
+                    None,
+                    ExecLevel::Warn,
+                    "live",
+                    format!(
+                        "deribit session CONNECTED ({}) — 1 live gateway. Cross-venue attempts stay refused until a second venue gateway exists; LIVE PREFLIGHT and the SMOKE TEST are available",
+                        self.live.ws_url
+                    ),
+                );
+            }
+            LiveMsg::Failed(e) => {
+                self.live.session_up = false;
+                self.ev(
+                    None,
+                    ExecLevel::Error,
+                    "live",
+                    format!("deribit session FAILED: {e} — fix credentials/endpoint and run LIVE PREFLIGHT"),
+                );
+            }
+            LiveMsg::Preflight(checks) => {
+                let mut all_ok = true;
+                self.live.last_preflight = checks.iter().map(|c| c.line()).collect();
+                for c in &checks {
+                    if !c.ok {
+                        all_ok = false;
+                    }
+                    self.ev(
+                        None,
+                        if c.ok { ExecLevel::Info } else { ExecLevel::Warn },
+                        "live",
+                        c.line(),
+                    );
+                }
+                self.ev(
+                    None,
+                    if all_ok { ExecLevel::Warn } else { ExecLevel::Error },
+                    "live",
+                    format!(
+                        "preflight {} — {} checks",
+                        if all_ok { "PASSED" } else { "FAILED" },
+                        checks.len()
+                    ),
+                );
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Round-trip one minimum-size Deribit order to prove the live path.
+    fn live_smoke_test(&mut self, instrument: Option<String>) {
+        let Some(sess) = self.deribit.clone() else {
+            self.ev(
+                None,
+                ExecLevel::Error,
+                "live",
+                "smoke test needs live mode with a connected Deribit session (IVARB_MODE=live + keys + IVARB_LIVE_CONFIRM=yes)".into(),
+            );
+            return;
+        };
+        if self.kill.is_some() {
+            self.ev(None, ExecLevel::Error, "live", "smoke test refused while the kill switch is engaged".into());
+            return;
+        }
+
+        // Resolve the instrument: explicit, or the best live deribit leg.
+        let inst = match instrument.filter(|s| !s.trim().is_empty()) {
+            Some(s) => s.trim().to_string(),
+            None => {
+                let snap = self.deps.snapshot.load();
+                let pick = snap
+                    .opportunities
+                    .iter()
+                    .filter(|o| !o.stale && !o.retired)
+                    .filter(|o| o.buy_venue == "deribit" || o.sell_venue == "deribit")
+                    .max_by(|a, b| a.ev_vp.total_cmp(&b.ev_vp));
+                match pick {
+                    Some(o) => live::venue_symbol(
+                        "deribit",
+                        &o.underlying,
+                        live::ymd_from_ms(o.expiry_ms),
+                        o.strike,
+                        o.right.letter(),
+                    ),
+                    None => {
+                        self.ev(
+                            None,
+                            ExecLevel::Error,
+                            "live",
+                            "no live deribit leg in the scanner to smoke-test — pass an instrument explicitly".into(),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
+        self.ev(
+            None,
+            ExecLevel::Warn,
+            "live",
+            format!("smoke test on {inst}: 0.1 IOC buy at the ask, immediate sell-back at the bid — costs the spread + fees"),
+        );
+        let etx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let msg = match live::live_smoke_test(&sess, &inst, 0.1).await {
+                Ok(r) => format!(
+                    "smoke test {}: bought {:.2} @ ${:.2}, sold {:.2} @ ${:.2} — round-trip {:+.2} USD (spread + fees)",
+                    r.instrument,
+                    r.buy.contracts,
+                    r.buy.px_unit,
+                    r.sell.contracts,
+                    r.sell.px_unit,
+                    r.round_trip_usd
+                ),
+                Err(e) => format!("smoke test FAILED on {inst}: {e}"),
+            };
+            let _ = etx.send(ExecEvent {
+                t_ms: now_ms(),
+                attempt: 0,
+                opp: None,
+                level: if msg.contains("FAILED") {
+                    ExecLevel::Error
+                } else {
+                    ExecLevel::Warn
+                },
+                state: "live".into(),
+                msg,
+            });
+        });
+    }
+
+    // ------------------------------------------------------------------
     // scanner
     // ------------------------------------------------------------------
     fn scan(&mut self) {
         if !self.armed || self.kill.is_some() {
+            return;
+        }
+        if matches!(self.mode, ExecMode::Live) && !self.route_ready() {
+            if !self.route_warned {
+                self.route_warned = true;
+                self.ev(
+                    None,
+                    ExecLevel::Warn,
+                    "live",
+                    "live mode: no complete route yet — cross-venue attempts refused (a paper leg inside a live attempt is forbidden); smoke test + preflight remain available".into(),
+                );
+            }
             return;
         }
         if self.live_attempts.len() as u32 >= self.settings.max_concurrent_attempts {
@@ -368,7 +656,12 @@ impl Core {
         for p in self.positions.values() {
             unrealized += p.mtm.unrealized_usd;
         }
-        // Manual takes bypass the armed flag but respect every risk gate.
+        // Manual takes bypass the armed flag but respect every risk gate —
+        // and the live route-completeness rule.
+        if let Err(reason) = self.live_route_ok(&o) {
+            self.ev(Some(o.id.clone()), ExecLevel::Error, "manual", format!("manual TAKE refused: {reason}"));
+            return;
+        }
         match self.risk.preflight(&o, &snap, &self.settings, true, &self.kill, self.stats.realized_usd, unrealized, now) {
             Ok(auto_units) => {
                 let units = units.unwrap_or(auto_units).min(auto_units).max(0.01);
@@ -877,12 +1170,36 @@ impl Core {
             trades: self.trades.iter().cloned().collect(),
             events: self.events.iter().cloned().collect(),
             balances: self.broker.balances(),
+            live: self.live_status_now(),
         };
         if let Ok(txt) = serde_json::to_string(&ivarb_protocol::ServerMsg::Exec { exec: snapshot.clone() }) {
             let _ = self.deps.bcast.send(Arc::new(txt));
         }
         self.out.store(Arc::new(snapshot));
         self.dirty = false;
+    }
+
+    /// LiveStatus with the derived fields refreshed at publish time.
+    fn live_status_now(&self) -> LiveStatus {
+        let mut live = self.live.clone();
+        live.live_gateways = self.live_gateways();
+        live.route_ready = self.route_ready();
+        live.blockers = if matches!(self.mode, ExecMode::Live) {
+            let mut b = Vec::new();
+            if !live.session_up {
+                b.push("deribit session not connected".into());
+            }
+            if live.live_gateways < 2 {
+                b.push(format!(
+                    "{} live gateway(s) — cross-venue routes need one on each leg; attempts stay refused rather than faking a leg",
+                    live.live_gateways
+                ));
+            }
+            b
+        } else {
+            self.arming_blockers.clone()
+        };
+        live
     }
 }
 

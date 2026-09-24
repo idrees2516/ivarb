@@ -839,6 +839,10 @@ impl Engine {
             multihop_routes: self.multihop.len() as u32,
             holds_tracked: self.holds.len() as u32,
             ga_generation: self.ga_view.generation,
+            min_net_vp: self.cfg.min_net_vp,
+            exit_net_vp: self.cfg.exit_net_vp,
+            moneyness_pct: self.cfg.signal_moneyness_pct,
+            min_vega_usd: self.cfg.min_vega_usd,
         }
     }
 

@@ -384,6 +384,9 @@ pub struct ExecSnapshot {
     pub events: Vec<ExecEvent>,
     /// Paper balances per venue (USD-margined simulation).
     pub balances: Vec<(VenueId, f64)>,
+    /// Live-gateway readiness (env gates, session, route completeness).
+    #[serde(default)]
+    pub live: LiveStatus,
 }
 
 /// Commands accepted by the advantage taker (REST → executor).
@@ -398,6 +401,37 @@ pub enum ExecCommand {
     Take { opp: String, units: Option<f64> },
     Close { position: u64 },
     FlattenAll,
+    /// Validate the authenticated live path without placing strategy orders:
+    /// checks env arming gates, connects, authenticates and reads the account
+    /// summary. Safe in paper mode — it never orders.
+    LivePreflight,
+    /// Round-trip one minimum-size Deribit IOC order (buy then immediately
+    /// sell back) to prove the live order path end-to-end. Live mode only;
+    /// costs the spread + fees (typically a few USD on 0.1 BTC).
+    LiveSmokeTest { instrument: Option<String> },
+}
+
+/// Live-gateway readiness, published in every executor snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct LiveStatus {
+    /// IVARB_MODE=live requested.
+    pub requested: bool,
+    /// DERIBIT_API_KEY / DERIBIT_API_SECRET present.
+    pub keys_present: bool,
+    /// IVARB_LIVE_CONFIRM accepted (explicit arming acknowledgement).
+    pub confirmed: bool,
+    /// Authenticated Deribit session is connected.
+    pub session_up: bool,
+    /// WebSocket endpoint in use (prod or test.deribit.com).
+    pub ws_url: String,
+    /// Number of venues with a live order gateway (routes need ≥ 2).
+    pub live_gateways: u32,
+    /// True when at least two legs of a route could be executed live.
+    pub route_ready: bool,
+    /// Human-readable blockers, newest last.
+    pub blockers: Vec<String>,
+    /// Last preflight report lines ("name: OK detail" / "name: FAIL detail").
+    pub last_preflight: Vec<String>,
 }
 
 pub type HistoryPt = (i64, f64);
@@ -735,6 +769,19 @@ pub struct EngineStats {
     /// GA generation of the applied genome (0 = defaults).
     #[serde(default)]
     pub ga_generation: u32,
+    // ---- effective tuning (what the strategy layer is actually using) ----
+    /// Entry gate in vol points (before GA / regime multipliers).
+    #[serde(default)]
+    pub min_net_vp: f64,
+    /// Retirement gate (hysteresis), vp.
+    #[serde(default)]
+    pub exit_net_vp: f64,
+    /// Hard cap on the dynamic moneyness band (fraction, e.g. 0.10 = ±10%).
+    #[serde(default)]
+    pub moneyness_pct: f64,
+    /// Minimum tradable vega per contract, $/vp.
+    #[serde(default)]
+    pub min_vega_usd: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
