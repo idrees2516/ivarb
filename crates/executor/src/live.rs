@@ -205,10 +205,22 @@ const PX_TICK_BTC: f64 = 0.0001;
 const AMOUNT_STEP: f64 = 0.1;
 
 fn ceil_tick(x: f64, tick: f64) -> f64 {
-    (x / tick).ceil() * tick
+    snap((x / tick).ceil() * tick)
 }
 fn floor_tick(x: f64, tick: f64) -> f64 {
-    (x / tick).floor() * tick
+    snap((x / tick).floor() * tick)
+}
+/// Kill f64 representation noise so a serialized price lands exactly on a
+/// tick (124 * 0.0001 must serialize as 0.0124, not 0.012400000000000001 —
+/// venues reject off-tick prices).
+fn snap(v: f64) -> f64 {
+    (v * 1e10).round() / 1e10
+}
+/// Snap an order size to the 0.1-contract amount step, decimal-exact.
+/// (`x / 0.1` in binary floats turns 0.15 into 1.4999…8 → rounds DOWN to
+/// 0.1; scaling first keeps 0.15 → 1.5 → 0.2 as the venue intends.)
+fn snap_amount(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }
 
 impl DeribitSession {
@@ -362,7 +374,7 @@ impl DeribitSession {
             Side::Buy => "private/buy",
             Side::Sell => "private/sell",
         };
-        let amount = (amount / AMOUNT_STEP).round() * AMOUNT_STEP;
+        let amount = snap_amount(amount);
         let v = self
             .rpc(
                 method,
@@ -657,6 +669,8 @@ mod tests {
         assert_eq!(floor_tick(0.0123, PX_TICK_BTC), 0.0123);
         assert_eq!(floor_tick(0.0123999, PX_TICK_BTC), 0.0123);
         // Amounts snap to the 0.1 contract step in place_ioc.
-        assert_eq!((0.15 / AMOUNT_STEP).round() * AMOUNT_STEP, 0.2);
+        assert_eq!(snap_amount(0.15), 0.2);
+        assert_eq!(snap_amount(0.14), 0.1);
+        assert_eq!(snap_amount(0.1), 0.1);
     }
 }
