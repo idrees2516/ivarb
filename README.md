@@ -1,8 +1,9 @@
 # IVARB — Cross-Exchange IV Arbitrage Scanner
 
 A pure-Rust implementation of the IV arbitrage scanner: live market data from
-six options exchanges, fee-adjusted divergence detection, and a WASM-compiled
-dashboard — no JavaScript application code anywhere.
+eight options exchanges, fee-adjusted divergence detection, an execution
+engine with paper/live gateways, and a WASM-compiled dashboard — no JavaScript
+application code anywhere.
 
 ```
 ┌─────────────────────────────  cargo workspace  ─────────────────────────────┐
@@ -10,6 +11,7 @@ dashboard — no JavaScript application code anywhere.
 │  crates/protocol   shared wire types (serde only, wasm-safe)                │
 │  crates/quant      Black-Scholes · implied-vol solver · fee math (no deps)  │
 │  crates/engine     venue connectors · arb strategy · history · sim feed     │
+│  crates/executor   advantage taker: risk, paper broker, Deribit live gw     │
 │  crates/server     Axum: /ws hub · REST · static · JSONL audit log          │
 │  frontend          Leptos CSR → trunk → wasm32 → dist/ (served by server)   │
 │                                                                             │
@@ -75,7 +77,7 @@ quotes.
 | binance | REST `eapi/v1/mark` poll (5s)                        | native markIV/bidIV/askIV (fractions, normalized)                     |
 | delta   | REST `/v2/tickers` poll (5s)                         | native quote IVs + sizes; `contract_value` parsed per product          |
 | aevo    | REST `/markets` poll (~10s)                          | 1.5 MB snapshot; slow over HTTP/1.1 — generous timeout applied         |
-| derive  | experimental — auto-disabled (endpoint shape changed, 404) | re-enable where reachable                                             |
+| derive  | REST RPC `public/get_tickers` batched per expiry (api.lyra.finance) | whole expiry chain per call; compact keys; ~956 instruments       |
 | thalex  | experimental — auto-disabled (unreachable from host)  | re-enable where reachable                                             |
 
 If no venue is reachable, `IVARB_SIM=auto` (default) activates a realistic
@@ -194,13 +196,36 @@ conversion, fee-dominated, stale), OU half-life recovery, Kalman filtering,
 latency-histogram percentiles, and the GA replay model (high gates avoid junk
 episodes).
 
-## Extending to live execution
+## Execution: the advantage taker (paper-first, live-ready)
 
-The engine is signal-only by design (public market data, no keys). To trade it:
-add a `VenueExecutor` trait next to `VenueConnector` (auth + order placement per
-venue), drive it from the 7-step flow (IOC limits at the touch, 10s legging
-timeout, delta-hedge leg), and reuse `Opportunity` directly. The JSONL audit
-log already records every signal lifecycle event for post-trade analysis.
+`crates/executor` turns signals into managed positions. It runs in **paper
+mode by default** — a broker that models taker/maker fills with latency
+(60–250 ms), depth partials, and slippage (2 bp + 8 bp·√(size/depth)) — and
+carries a fully gated **live path for Deribit**:
+
+```
+IVARB_MODE=live            # 1) explicit mode switch
+DERIBIT_API_KEY=...        # 2) trade-scope key (withdrawal OFF)
+DERIBIT_API_SECRET=...
+IVARB_LIVE_CONFIRM=yes     # 3) final acknowledgement — a stray mode flip
+                           #    alone can never arm the book
+```
+
+The scaffold exposes `live_preflight()` (connect + `public/auth` +
+`private/get_account_summary` — equity and available funds, never orders)
+and `live_smoke_test()` (one minimum-size IOC buy immediately sold back,
+priced off the live book — proves the order path end-to-end for the cost of
+the spread; free on `test.deribit.com` via `DERIBIT_WS_URL`). Two-leg
+attempts in live mode additionally require a live gateway on **both**
+venues: with only Deribit keys the taker refuses cross-venue routes rather
+than faking the second leg.
+
+Risk controls around it: preflight collateral checks, per-instrument dedup
+and cooldowns, fractional-Kelly sizing × participation caps, vega budget,
+daily-loss circuit breaker with UTC rollover, the 10-second legging rule
+(cancel + unwind the filled leg), residual-delta hedging, and fresh-quote
+gates on every pricing decision. The JSONL audit log records every signal
+lifecycle event for post-trade analysis.
 
 ## Disclaimer
 
