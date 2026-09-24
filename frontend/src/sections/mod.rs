@@ -1,5 +1,8 @@
 pub mod calc;
 pub mod detail;
+pub mod ga;
+pub mod holdlab;
+pub mod multihop;
 pub mod risk;
 pub mod scanner;
 pub mod steps;

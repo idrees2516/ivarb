@@ -1,11 +1,17 @@
 //! HTTP + WebSocket server for the IV arb scanner.
 //!
-//! - `GET /`            — serves the compiled Leptos frontend (frontend/dist)
-//! - `GET /ws`          — live engine feed (snapshot on connect + deltas)
-//! - `GET /api/snapshot`— full engine snapshot (JSON)
-//! - `GET /api/opps`    — active opportunities
-//! - `GET /api/venues`  — venue connection statuses
-//! - `GET /healthz`     — liveness probe
+//! - `GET /`              — serves the compiled Leptos frontend (frontend/dist)
+//! - `GET /ws`            — live engine feed (snapshot on connect + deltas)
+//! - `GET /api/snapshot`  — full engine snapshot (opps + holds + multihop)
+//! - `GET /api/opps`      — active opportunities
+//! - `GET /api/venues`    — venue connection statuses
+//! - `GET /api/holds`     — hold-to-expiry lab candidates
+//! - `GET /api/multihop`  — live multi-hop arbitrage routes
+//! - `GET /api/ga`        — genetic-optimizer status
+//! - `POST /api/ga/cmd`   — control the genetic optimizer
+//! - `GET /api/exec`      — advantage-taker state
+//! - `POST /api/exec/cmd` — control the advantage taker
+//! - `GET /healthz`       — liveness probe
 //!
 //! Engine→client frames are serialized exactly once and fanned out through a
 //! broadcast channel; snapshots are read wait-free from ArcSwap.
@@ -22,9 +28,11 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Json;
-use ivarb_engine::{spawn as spawn_engine, EngineConfig};
+use ivarb_engine::{spawn as spawn_engine, EngineConfig, GaHandle};
 use ivarb_executor::{spawn as spawn_executor, ExecDeps};
-use ivarb_protocol::{ClientMsg, ExecCommand, ExecSnapshot, ServerMsg, Snapshot};
+use ivarb_protocol::{
+    ClientMsg, ExecCommand, ExecSnapshot, GaCommand, GaStatus, ServerMsg, Snapshot,
+};
 use tokio::sync::{broadcast, mpsc};
 
 #[global_allocator]
@@ -36,6 +44,8 @@ pub struct AppState {
     pub bcast: broadcast::Sender<Arc<String>>,
     pub exec_snap: Arc<ArcSwap<ExecSnapshot>>,
     pub exec_cmd: mpsc::UnboundedSender<ExecCommand>,
+    /// Genetic-optimizer handle (status reads + commands).
+    pub ga: GaHandle,
 }
 
 fn now_ms() -> i64 {
@@ -75,7 +85,40 @@ async fn main() -> anyhow::Result<()> {
         bcast: handles.bcast.clone(),
         exec_snap: exec.snapshot.clone(),
         exec_cmd: exec.cmd_tx.clone(),
+        ga: handles.ga.clone(),
     };
+
+    // GA status pump: the optimizer thread is event-driven (own OS thread,
+    // crossbeam channels), so the server polls its wait-free shared status
+    // once per second and republishes it on the broadcast bus.
+    {
+        let st = state.clone();
+        let mut shutdown = handles.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut last_gen: u32 = 0;
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let (status, changed) = {
+                            let sh = st.ga.shared.load();
+                            (sh.status.clone(), sh.status.generation != last_gen)
+                        };
+                        if changed {
+                            last_gen = status.generation;
+                        }
+                        let msg = ServerMsg::Ga { status };
+                        if let Ok(txt) = serde_json::to_string(&msg) {
+                            let _ = st.bcast.send(Arc::new(txt));
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
+    }
 
     // JSONL signal audit writer (best-effort, non-blocking).
     tokio::spawn(signal_writer(
@@ -94,6 +137,10 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/snapshot", get(api_snapshot))
             .route("/api/opps", get(api_opps))
             .route("/api/venues", get(api_venues))
+            .route("/api/holds", get(api_holds))
+            .route("/api/multihop", get(api_multihop))
+            .route("/api/ga", get(api_ga))
+            .route("/api/ga/cmd", post(api_ga_cmd))
             .route("/api/exec", get(api_exec))
             .route("/api/exec/cmd", post(api_exec_cmd))
             .route("/healthz", get(healthz))
@@ -105,6 +152,10 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/snapshot", get(api_snapshot))
             .route("/api/opps", get(api_opps))
             .route("/api/venues", get(api_venues))
+            .route("/api/holds", get(api_holds))
+            .route("/api/multihop", get(api_multihop))
+            .route("/api/ga", get(api_ga))
+            .route("/api/ga/cmd", post(api_ga_cmd))
             .route("/api/exec", get(api_exec))
             .route("/api/exec/cmd", post(api_exec_cmd))
             .route("/healthz", get(healthz))
@@ -167,6 +218,32 @@ async fn api_opps(State(st): State<AppState>) -> Json<Vec<ivarb_protocol::Opport
 async fn api_venues(State(st): State<AppState>) -> Json<Vec<ivarb_protocol::VenueStatus>> {
     let snap: Arc<Snapshot> = Arc::clone(&st.snapshot.load());
     Json(snap.venues.clone())
+}
+
+async fn api_holds(State(st): State<AppState>) -> Json<Vec<ivarb_protocol::HoldCandidate>> {
+    let snap: Arc<Snapshot> = Arc::clone(&st.snapshot.load());
+    Json(snap.holds.clone())
+}
+
+async fn api_multihop(State(st): State<AppState>) -> Json<Vec<ivarb_protocol::MultiHopRoute>> {
+    let snap: Arc<Snapshot> = Arc::clone(&st.snapshot.load());
+    Json(snap.multihop.clone())
+}
+
+async fn api_ga(State(st): State<AppState>) -> Json<GaStatus> {
+    let sh = st.ga.shared.load();
+    Json(sh.status.clone())
+}
+
+async fn api_ga_cmd(
+    State(st): State<AppState>,
+    Json(cmd): Json<GaCommand>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    st.ga
+        .cmd_tx
+        .send(cmd)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "optimizer stopped"))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn api_exec(State(st): State<AppState>) -> Json<ExecSnapshot> {

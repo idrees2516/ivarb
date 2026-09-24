@@ -84,18 +84,26 @@ forces it. The UI shows a SIM banner whenever simulated data is in use.
 
 ## Configuration (env)
 
-| Variable             | Default            | Meaning                          |
-|----------------------|--------------------|----------------------------------|
-| `IVARB_UNDERLYINGS`  | `BTC,ETH`          | underlyings to scan              |
-| `IVARB_MIN_NET_VP`   | `0.5`              | entry threshold (vp)             |
-| `IVARB_EXIT_VP`      | `0.25`             | retire threshold (hysteresis)    |
-| `IVARB_STALE_MS`     | `45000`            | quote age → stale flag           |
-| `IVARB_RETIRE_MS`    | `180000`           | quote age → remove               |
-| `IVARB_VENUES`       | all                | comma list of venue ids to enable |
-| `IVARB_SIM`          | `auto`             | `auto` / `always` / `off`        |
-| `IVARB_BROADCAST_MS` | `250`              | delta push cadence               |
-| `IVARB_DATA_DIR`     | `./data`           | audit log location               |
-| `PORT` / `BIND`      | `3000` / `0.0.0.0` | server bind                      |
+| Variable             | Default              | Meaning                                        |
+|----------------------|----------------------|------------------------------------------------|
+| `IVARB_UNDERLYINGS`  | `BTC,ETH,SOL`        | underlyings to scan (any venue-listed symbol)  |
+| `IVARB_MIN_NET_VP`   | `0.5`                | entry threshold (vp)                           |
+| `IVARB_EXIT_VP`      | `0.25`               | retire threshold (hysteresis)                  |
+| `IVARB_STALE_MS`     | `45000`              | quote age → stale flag                         |
+| `IVARB_RETIRE_MS`    | `180000`             | quote age → remove                             |
+| `IVARB_VENUES`       | all                  | comma list of venue ids to enable              |
+| `IVARB_SIM`          | `auto`               | `auto` / `always` / `off`                      |
+| `IVARB_BROADCAST_MS` | `1`                  | WS delta push cadence (ms)                     |
+| `IVARB_SWEEP_MS`     | `250`                | housekeeping cadence                           |
+| `IVARB_SNAPSHOT_MS`  | `1000`               | full snapshot republish                        |
+| `IVARB_MULTIHOP_MS`  | `250`                | multi-hop + analytics pass (chunked ≤120 fam.) |
+| `IVARB_HOLDS_MS`     | `500`                | per-opp hold-to-expiry stats refresh           |
+| `IVARB_GA_ENABLED`   | `true`               | genetic optimizer on/off                       |
+| `IVARB_GA_APPLY`     | `true`               | best genome drives live gates                  |
+| `IVARB_GA_GEN_MS`    | `15000`              | ms per GA generation                           |
+| `IVARB_EXEC_SCAN_MS` | `1`                  | advantage-taker scan loop                      |
+| `IVARB_DATA_DIR`     | `./data`             | audit log location                             |
+| `PORT` / `BIND`      | `3000` / `0.0.0.0`   | server bind                                    |
 
 ## Performance design
 
@@ -114,6 +122,52 @@ forces it. The UI shows a SIM banner whenever simulated data is in use.
 - **Executable-edge preference** — signals use the ask IV you would buy at and
   the bid IV you would sell at (`EXEC` mode); mark-based fallback is flagged.
 - **mimalloc** global allocator on the server.
+- **Millisecond pipeline telemetry** — quote-arrival → signal-computed and
+  signal → serialized-WS-frame latencies are recorded into fixed 1 024-sample
+  rings; the dashboard shows live p50/p99/p999 (typical: pipe p50 ≈ 30 µs,
+  p99 ≈ 1 ms; wire p50 ≈ 15 µs at the 1 ms broadcast cadence).
+- **Chunked analytics** — the multi-hop/hold/GA-tape pass processes at most
+  120 strike families per 250 ms tick so the synchronous analytics never
+  blocks the engine loop (routes from un-scanned families survive the pass).
+
+## Hold-to-expiry lab (when the arb fails but the option is cheap)
+
+Divergences below the fee-adjusted gate are not discarded: if the cheap leg's
+ask still implies a lower vol than the cross-venue consensus, buying and
+holding it to expiry can be a positive-EV outright long-vol position. The
+engine tracks these near-misses (`/api/holds`, WS `holds` frames) and the lab
+section prices the strategy end-to-end: premium outlay, entry fee, theta per
+day (now / at half-life / near expiry), extrinsic as the maximum quiet-case
+bleed, vol edge in vp, expected value per contract, break-even spot at expiry,
+P(terminal P&L > 0) and a 4 000-path antithetic Monte-Carlo terminal P&L
+distribution (p05/p50/p95/CVaR05) — computed in the browser from the same
+Rust quant crate compiled to WASM. Every active scanner row also carries its
+own hold view (with OU convergence ETA and Kalman spread-noise σ) in the
+detail panel.
+
+## Multi-hop arbitrage
+
+Two-leg arbitrage needs a tradable bid on the rich venue and ask on the cheap
+venue of the same option. Multi-hop removes that restriction: the engine
+builds an inventory walk over (venue × call/put) leg templates — buy at an
+ask, sell at a bid, convert call↔put on one venue via put-call parity with a
+perp hedge — and records every combination that is flat at expiry (cross-venue
+longs and shorts of the same right settle against each other) with positive
+cash flow after every fee. Re-scanned every 250 ms on touched strike families
+(`/api/multihop`, WS `multihop` frames); leg fees carry a GA-evolvable buffer.
+
+## Genetic strategy optimizer
+
+Twelve strategy parameters (entry-gate multiplier, exit fraction, patience,
+max hold, Kelly fraction, fee buffer, netted-theta factor, staleness cap,
+time-of-day gate shape, hold-lab EV gate, multi-hop fee buffer) form a genome.
+Every signal episode is taped; a genetic algorithm (population 48, elites 3,
+blend crossover, decaying Gaussian mutation, tournament selection) replays the
+last 8 000 episodes per individual each generation and evolves for risk-adjusted
+capture — the replay models fill probability, single-leg risk, theta burn, and
+refuses to bank "convergences" inside the quote-noise band (phantom collapse →
+forced unwind). The best genome can drive the live entry gates (`/api/ga`,
+`POST /api/ga/cmd`: `pause` / `resume` / `set_applied` / `reset`).
 
 ## Strategy layer (capturing value)
 
@@ -135,7 +189,10 @@ Covers BS pricing references, put-call parity, vega conversions, the spec's
 worked fee example (0.03% × $65k / $1k = 0.0195 vp), IV-solver roundtrips
 across 1%–300% vol, cross-venue symbol parsing (Deribit/OKX/Bybit/Binance/
 Delta/Thalex/Derive formats incl. the `-USDT` margin suffix and DDMMYY dates),
-and expiry math.
+expiry math, hold-to-expiry lab gates, multi-hop route detection (direct,
+conversion, fee-dominated, stale), OU half-life recovery, Kalman filtering,
+latency-histogram percentiles, and the GA replay model (high gates avoid junk
+episodes).
 
 ## Extending to live execution
 

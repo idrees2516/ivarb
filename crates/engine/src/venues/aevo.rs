@@ -231,7 +231,7 @@ impl Aevo {
                 ds.dedup();
                 ds.into_iter().take(2).collect()
             };
-            for (d, k, _right, name) in rows {
+            for (d, _k, _right, name) in rows {
                 if dates.contains(&d) && !selected.contains(&name) {
                     selected.push(name);
                 }

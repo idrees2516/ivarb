@@ -60,9 +60,6 @@ pub struct EngineConfig {
     pub min_dte: i32,
     pub max_dte: i32,
     pub sim: SimMode,
-    pub broadcast_ms: u64,
-    pub sweep_ms: u64,
-    pub snapshot_ms: u64,
     pub data_dir: String,
     pub max_instruments_per_venue: usize,
     /// How long a venue may produce zero messages before being marked Degraded.
@@ -111,7 +108,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             venues: default_venues(),
-            underlyings: vec!["BTC".into(), "ETH".into()],
+            underlyings: vec!["BTC".into(), "ETH".into(), "SOL".into()],
             min_net_vp: 0.5,
             exit_net_vp: 0.25,
             stale_ms: 45_000,

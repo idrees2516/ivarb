@@ -22,6 +22,7 @@ pub fn ScannerSection() -> impl IntoView {
                 UndFilter::All => true,
                 UndFilter::Btc => o.underlying == "BTC",
                 UndFilter::Eth => o.underlying == "ETH",
+                UndFilter::Sol => o.underlying == "SOL",
             })
             .collect::<Vec<_>>()
     });
@@ -56,6 +57,8 @@ pub fn ScannerSection() -> impl IntoView {
                         on_click=move || st.und_filter.set(UndFilter::Btc) label="BTC"/>
                     <SegButton active=move || st.und_filter.get() == UndFilter::Eth
                         on_click=move || st.und_filter.set(UndFilter::Eth) label="ETH"/>
+                    <SegButton active=move || st.und_filter.get() == UndFilter::Sol
+                        on_click=move || st.und_filter.set(UndFilter::Sol) label="SOL"/>
                 </div>
                 <div class="seg" role="tablist">
                     <SegButton active=move || st.sort.get() == SortMode::Newest

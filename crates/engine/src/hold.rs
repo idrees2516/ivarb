@@ -77,13 +77,11 @@ impl HoldTracker {
         now: i64,
         stale_ms: i64,
     ) {
-        if legs.len() < 2 || spot <= 0.0 {
-            return;
+        if legs.len() < 2 || spot <= 0.0 {            return;
         }
         let expiry = iso_from_ymd(key.date);
         let t = t_years(now, expiry_ms);
-        if t <= 1e-5 || t > 1.2 {
-            return;
+        if t <= 1e-5 || t > 1.2 {            return;
         }
 
         // Cheapest fresh ask across venues.
@@ -105,12 +103,10 @@ impl HoldTracker {
                 }
             }
         }
-        let Some((venue, fee_rate, contract_size, bq)) = best else {
-            return;
+        let Some((venue, fee_rate, contract_size, bq)) = best else {            return;
         };
         let ask_px = bq.px_ask_unit.unwrap_or(0.0);
-        if ask_px <= 0.0 {
-            return;
+        if ask_px <= 0.0 {            return;
         }
 
         // Consensus forecast: median of the venues' mark IVs (vp).
@@ -119,8 +115,7 @@ impl HoldTracker {
             .filter_map(|(_, _, _, q)| q.iv_mark_vp)
             .filter(|v| (15.0..=250.0).contains(v))
             .collect();
-        if marks.len() < 2 {
-            return;
+        if marks.len() < 2 {            return;
         }
         marks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let consensus_vp = marks[marks.len() / 2];
@@ -128,8 +123,7 @@ impl HoldTracker {
 
         // The arb view (best sell bid vs this ask) for contrast.
         let vega_unit = vega_per_vp_unit(spot, key.strike(), t, consensus_raw);
-        if vega_unit < 0.5 {
-            return; // dust vega: fees in vp explode, nothing to discuss
+        if vega_unit < 0.5 {            return; // dust vega: fees in vp explode, nothing to discuss
         }
         let mut best_bid: Option<(f64, f64)> = None; // (bid, sell-venue fee rate)
         for (_, fee_v, _, q) in legs {
@@ -166,14 +160,10 @@ impl HoldTracker {
 
         // Keep candidates that are (a) below the arb entry gate and (b) have
         // a meaningful hold EV or IV edge.
-        let iv_edge = hold.iv_edge_vp;
-        if arb_net_vp >= 0.5 {
-            return; // real arb — the scanner owns it
+        let iv_edge = hold.iv_edge_vp;        if arb_net_vp >= 0.5 {            return; // real arb — the scanner owns it
         }
-        if hold.ev_usd < self.ev_gate_usd * 0.2 && iv_edge < 0.5 {
-            return; // nothing to hold either
+        if hold.ev_usd < self.ev_gate_usd * 0.2 && iv_edge < 0.5 {            return; // nothing to hold either
         }
-
         let implied_vp = ivarb_quant::implied_vol(ask_px, spot, key.strike(), t, crate::strategy::qright(key.right))
             .map(|v| v * 100.0)
             .unwrap_or(0.0);
@@ -197,7 +187,7 @@ impl HoldTracker {
             },
             venue: venue.to_string(),
             ask_px_unit: ask_px,
-            consensus_iv_vp,
+            consensus_iv_vp: consensus_vp,
             implied_iv_vp: implied_vp,
             fee_rate,
             spot,
@@ -236,6 +226,44 @@ impl HoldTracker {
     }
 }
 
+/// Hold-to-expiry stats for an *active* arb opportunity's cheap (buy) leg —
+/// the "arb is good, but what if I just kept the option?" view. Reconstructed
+/// from the opportunity's own wire fields: entry fee is estimated as half the
+/// round-trip fee_vp on the leg vega, and the vol forecast is the mid IV of
+/// the two venues (the same consensus the scanner uses).
+pub fn hold_stats_for_opp(
+    spot: f64,
+    strike: f64,
+    t_years: f64,
+    right_call: bool,
+    ask_px_unit: f64,
+    roundtrip_fee_vp: f64,
+    vega_unit: f64,
+    consensus_iv_raw: f64,
+    contract_size: f64,
+) -> HoldStats {
+    let fee_rate = if spot > 0.0 && vega_unit > 1e-9 {
+        (roundtrip_fee_vp * 0.5 * vega_unit / spot).clamp(0.0, 0.01)
+    } else {
+        0.0003
+    };
+    let right = if right_call {
+        ivarb_quant::Right::Call
+    } else {
+        ivarb_quant::Right::Put
+    };
+    to_stats(ivarb_quant::hold_analyze_lite(
+        spot,
+        strike,
+        t_years,
+        right,
+        ask_px_unit,
+        fee_rate,
+        consensus_iv_raw,
+        contract_size,
+    ))
+}
+
 impl Default for HoldTracker {
     fn default() -> Self {
         Self::new()
@@ -261,7 +289,7 @@ mod tests {
 
     fn q(iv_mark: f64, bid: f64, ask: f64, recv_ms: i64) -> LegQuote {
         let t = InstrTick {
-            key: InstKey { und: 0, date: 20261230, strike_ticks: 84_000_000, right: RIGHT_CALL },
+            key: InstKey { und: 0, date: 20261230, strike_ticks: 840_000_000, right: RIGHT_CALL },
             iv_mark_vp: Some(iv_mark),
             iv_bid_vp: None,
             iv_ask_vp: None,
@@ -277,17 +305,59 @@ mod tests {
         LegQuote::from_tick(&t, recv_ms)
     }
 
+    /// `now` sits 30 days before the fixed expiry so the tenor is stable
+    /// regardless of the wall clock the test runs on; ticks are fresh.
+    fn test_now() -> i64 {
+        crate::key::ymd_to_expiry_ms(20261230).unwrap() - 30 * 86_400_000
+    }
+
+// scratch: trace where refresh() bails
+#[test]
+fn debug_hold_trace() {
+    use super::*;
+    use crate::key::RIGHT_CALL;
+    use crate::msg::InstrTick;
+    let now = crate::key::ymd_to_expiry_ms(20261230).unwrap() - 30 * 86_400_000;
+    let recv = now - 1_000;
+    let mk = |iv: f64, bid: f64, ask: f64| {
+        let t = InstrTick {
+            key: InstKey { und: 0, date: 20261230, strike_ticks: 840_000_000, right: RIGHT_CALL },
+            iv_mark_vp: Some(iv), iv_bid_vp: None, iv_ask_vp: None,
+            px_mark_unit: Some((bid + ask) / 2.0), px_bid_unit: Some(bid), px_ask_unit: Some(ask),
+            size_bid: Some(1.0), size_ask: Some(1.0), spot: Some(84_000.0),
+            contract_size: None, venue_ts_ms: Some(recv),
+        };
+        LegQuote::from_tick(&t, recv)
+    };
+    let qa = mk(62.0, 5_900.0, 5_920.0);
+    let qb = mk(65.5, 5_960.0, 5_985.0);
+    let key = InstKey { und: 0, date: 20261230, strike_ticks: 840_000_000, right: RIGHT_CALL };
+    let t_y = crate::key::t_years(now, crate::key::ymd_to_expiry_ms(20261230).unwrap());
+    eprintln!("t_years = {t_y}");
+    let vega_unit = ivarb_quant::vega_per_vp_unit(84_000.0, 84_000.0, t_y, 0.6375);
+    eprintln!("vega_unit = {vega_unit}");
+    let exp = ivarb_quant::expected_terminal_payoff(84_000.0, 84_000.0, t_y, 0.6375, 0.0, ivarb_quant::Right::Call);
+    eprintln!("expected payoff = {exp}");
+    let l = ivarb_quant::hold_analyze_lite(84_000.0, 84_000.0, t_y, ivarb_quant::Right::Call, 5_920.0, 0.0003, 0.6375, 1.0);
+    eprintln!("lite ev_usd = {}, iv_edge = {}, theta = {}", l.ev_usd, l.iv_edge_vp, l.theta_day_usd);
+    let spread = (5_960.0 - 5_920.0) / vega_unit;
+    let fee = ivarb_quant::fee_vp(0.0003, 84_000.0, vega_unit) * 2.0;
+    eprintln!("spread_vp = {spread}, fee_vp = {fee}, net = {}", spread - fee);
+}
+
     #[test]
     fn tracks_near_miss_below_arb_gate() {
         let mut tr = HoldTracker::new();
-        let qa = q(62.0, 5_900.0, 5_920.0, 1_000); // cheap venue
-        let qb = q(65.5, 5_960.0, 5_985.0, 1_000); // rich venue
-        let key = InstKey { und: 0, date: 20261230, strike_ticks: 84_000_000, right: RIGHT_CALL };
+        let now = test_now();
+        let recv = now - 1_000;
+        let qa = q(62.0, 5_900.0, 5_920.0, recv); // cheap venue
+        let qb = q(65.5, 5_960.0, 5_985.0, recv); // rich venue
+        let key = InstKey { und: 0, date: 20261230, strike_ticks: 840_000_000, right: RIGHT_CALL };
         let legs: Vec<(&str, f64, f64, &LegQuote)> = vec![
             ("a", 0.0003, 1.0, &qa),
             ("b", 0.0003, 1.0, &qb),
         ];
-        tr.refresh(&key, "BTC", &legs, 84_000.0, crate::key::ymd_to_expiry_ms(20261230).unwrap(), 2_000, 45_000);
+        tr.refresh(&key, "BTC", &legs, 84_000.0, crate::key::ymd_to_expiry_ms(20261230).unwrap(), now, 45_000);
         assert_eq!(tr.len(), 1, "near-miss should be tracked");
         let snap = tr.snapshot();
         let c = &snap[0];
@@ -303,14 +373,16 @@ mod tests {
     #[test]
     fn ignores_real_arbs() {
         let mut tr = HoldTracker::new();
-        let qa = q(58.0, 5_100.0, 5_120.0, 1_000);
-        let qb = q(66.0, 5_600.0, 5_640.0, 1_000);
-        let key = InstKey { und: 0, date: 20261230, strike_ticks: 84_000_000, right: RIGHT_CALL };
+        let now = test_now();
+        let recv = now - 1_000;
+        let qa = q(58.0, 5_100.0, 5_120.0, recv);
+        let qb = q(66.0, 5_600.0, 5_640.0, recv);
+        let key = InstKey { und: 0, date: 20261230, strike_ticks: 840_000_000, right: RIGHT_CALL };
         let legs: Vec<(&str, f64, f64, &LegQuote)> = vec![
             ("a", 0.0003, 1.0, &qa),
             ("b", 0.0003, 1.0, &qb),
         ];
-        tr.refresh(&key, "BTC", &legs, 84_000.0, crate::key::ymd_to_expiry_ms(20261230).unwrap(), 2_000, 45_000);
+        tr.refresh(&key, "BTC", &legs, 84_000.0, crate::key::ymd_to_expiry_ms(20261230).unwrap(), now, 45_000);
         // Spread ≈ 480/95 ≈ 5 vp ≫ gate → scanner territory, not the hold lab.
         assert_eq!(tr.len(), 0);
     }

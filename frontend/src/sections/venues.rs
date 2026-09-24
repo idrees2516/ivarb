@@ -137,7 +137,7 @@ pub fn VenuesSection() -> impl IntoView {
 
     view! {
         <section class="section" id="venues">
-            <SectionHead num="05" title="Exchange instructions"
+            <SectionHead num="08" title="Exchange instructions"
                 sub="Each exchange has a slightly different UI flow for placing options orders. Select the exchange you need — fee rates are indicative; verify on the venue."/>
             <div class="venues-panel">
                 <div class="venue-tabs">

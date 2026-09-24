@@ -26,16 +26,19 @@ use ivarb_protocol::{
 };
 
 use crate::config::{EngineConfig, VenueSpec};
-use crate::ga::{GaHandle, GaShared, GenomeView, TapeEvent};
+use crate::ga::{GaHandle, GaShared, GenomeView};
 use crate::hold::HoldTracker;
 use crate::key::{t_years, ymd_to_expiry_ms, InstKey, UnderlyingInterner};
 use crate::msg::{now_ms, InstrTick, VenueMsg};
-use crate::multihop::{self, MultihopParams};
+use crate::multihop;
 use crate::ou;
 use crate::perf::LatencyHist;
 use crate::strategy::{derive_ivs, evaluate_pair, LegQuote, OppCore};
 
 const MAX_BURST: usize = 2_048;
+
+/// Strike families re-scanned per analytics pass (chunking bound).
+const ANALYTICS_FAMILIES_PER_PASS: usize = 120;
 
 pub struct EngineHandles {
     pub venue_tx: mpsc::Sender<VenueMsg>,
@@ -54,7 +57,7 @@ pub struct EngineHandles {
     pub ga: GaHandle,
     /// Millisecond-fresh opportunity list for the executor's 1 ms scan loop
     /// (cheaper than republishing full snapshots).
-    pub opps_light: Arc<ArcSwap<Arc<Vec<Opportunity>>>>,
+    pub opps_light: Arc<ArcSwap<Vec<Opportunity>>>,
 }
 
 /// Replace the executor's watched-instrument set (canonical ids like
@@ -112,9 +115,7 @@ pub struct Engine {
     opps: FxHashMap<String, OppState>,
     dirty: FxHashSet<String>,
     retire_now: Vec<String>,
-    /// Millisecond-fresh opportunity cache published for the executor.
-    opps_cache: FxHashMap<String, Opportunity>,
-    opps_light: Arc<ArcSwap<Arc<Vec<Opportunity>>>>,
+    opps_light: Arc<ArcSwap<Vec<Opportunity>>>,
 
     // ---- advanced analytics ----
     /// Near-miss (below-gate) candidates for the hold-to-expiry lab.
@@ -179,6 +180,7 @@ impl Engine {
         watch_rx: mpsc::UnboundedReceiver<WatchCmd>,
         watched_out: Arc<ArcSwap<FxHashMap<String, Vec<WatchedLeg>>>>,
         ga: GaHandle,
+        opps_light: Arc<ArcSwap<Vec<Opportunity>>>,
     ) -> Self {
         let mut venues = FxHashMap::default();
         for spec in &cfg.venues {
@@ -239,8 +241,7 @@ impl Engine {
             opps: FxHashMap::default(),
             dirty: FxHashSet::default(),
             retire_now: Vec::new(),
-            opps_cache: FxHashMap::default(),
-            opps_light: Arc::new(ArcSwap::from_pointee(Arc::new(Vec::new()))),
+            opps_light,
             holds: HoldTracker::new(),
             multihop: Vec::new(),
             family_dirty: FxHashSet::default(),
@@ -414,6 +415,17 @@ impl Engine {
             }
 
             for mut tick in ticks {
+                // Venue-timestamp vs arrival lag (feed delay telemetry).
+                if let Some(vts) = tick.venue_ts_ms {
+                    if vts > 0 && now >= vts && now - vts < 60_000 {
+                        let lag = (now - vts) as f64;
+                        rt.lag_ms_ewma = if rt.lag_ms_ewma == 0.0 {
+                            lag
+                        } else {
+                            rt.lag_ms_ewma * 0.95 + lag * 0.05
+                        };
+                    }
+                }
                 let expiry = *self
                     .expiry_ms
                     .entry(tick.key)
@@ -470,6 +482,9 @@ impl Engine {
 
     /// Incremental cross-venue evaluation of one instrument.
     fn scan_key(&mut self, key: &InstKey, now: i64) {
+        // Mark the strike family dirty for the analytics pass (multi-hop
+        // routes + hold-lab candidates are re-scanned on the mh cadence).
+        self.family_dirty.insert(*key);
         let expiry = match self.expiry_ms.get(key) {
             Some(e) => *e,
             None => return,
@@ -546,11 +561,15 @@ impl Engine {
         let id = core.id.clone();
         let net = core.net_vp;
         let spot = core.spot;
+        // GA-aware entry gate: the applied genome multiplies the base gate
+        // (per time-of-day) before the mode multiplier.
+        let hour = ((now / 3_600_000).rem_euclid(24)) as f64;
+        let ga_mult = self.ga_view.gate_mult(hour);
         // Mark-mode signals (crossed-book divergences) face a stricter entry
         // gate: they are only convergence candidates, not executable edges.
         let entry_gate = match core.edge_mode {
-            EdgeMode::Exec => self.cfg.min_net_vp,
-            EdgeMode::Mark => self.cfg.min_net_vp * self.cfg.mark_gate_mult,
+            EdgeMode::Exec => self.cfg.min_net_vp * ga_mult,
+            EdgeMode::Mark => self.cfg.min_net_vp * self.cfg.mark_gate_mult * ga_mult,
         };
         match self.opps.entry(id.clone()) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -580,7 +599,7 @@ impl Engine {
                 // Time-aware strategy refresh (bucket may shift as expiry
                 // approaches — the strategy changes with the clock).
                 let age_ms = (now - st.opp.first_seen_ms).max(0) as f64;
-                let v = core.strategy_view(&self.cfg, age_ms, now);
+                let v = core.strategy_view_ga(&self.cfg, age_ms, now, &self.ga_view);
                 st.opp.tier = v.tier;
                 st.opp.bucket = v.bucket.label().to_string();
                 st.opp.dte = v.dte;
@@ -629,14 +648,18 @@ impl Engine {
                 let mut opp = core.to_opportunity(und, expiry_ms, now, Vec::new());
                 opp.spot = spot;
                 opp.t_years = t_years(now, expiry_ms);
-                // Stamp the time-aware strategy fields on creation.
-                let _v = opp_tier_stamp(&mut opp, &core, &self.cfg, now);
+                // Stamp the time-aware strategy fields on creation (GA-aware).
+                let _v = opp_tier_stamp(&mut opp, &core, &self.cfg, now, &self.ga_view);
                 let hist = VecDeque::from(vec![(now, net)]);
                 e.insert(OppState {
                     opp,
                     hist,
                     last_hist_ms: now,
                     last_log_ms: now,
+                    last_ou_ms: now,
+                    last_hold_ms: 0,
+                    last_tape_ms: now,
+                    kalman: ou::Kalman1::new(1e-4, 0.05),
                 });
                 if let Some(st) = self.opps.get(&id) {
                     log_signal_line(&self.signal_tx, &st.opp, "new", now);
@@ -652,6 +675,11 @@ impl Engine {
             if let Some(st) = self.opps.get(&id) {
                 items.push(st.opp.clone());
             }
+            // Episode over for the GA tape.
+            let _ = self
+                .ga
+                .tape_tx
+                .send(crate::ga::TapeEvent::End { id: id.clone() });
             self.opps.remove(&id);
         }
         for id in &self.dirty {
@@ -682,6 +710,7 @@ impl Engine {
                 rt.msg_window.pop_front();
             }
             let rate = rt.msg_window.len() as f64 / 10.0;
+            rt.status.lag_ms_ewma = rt.lag_ms_ewma;
             if (rt.status.msg_rate - rate).abs() > 0.05 {
                 rt.status.msg_rate = rate;
                 venue_changes = true;
@@ -714,6 +743,10 @@ impl Engine {
             if let Some(st) = self.opps.get(&id) {
                 log_signal_line(&self.signal_tx, &st.opp, "retire-stale", now);
             }
+            let _ = self
+                .ga
+                .tape_tx
+                .send(crate::ga::TapeEvent::End { id: id.clone() });
             self.opps.remove(&id);
             self.dirty.insert(id);
         }
@@ -783,6 +816,8 @@ impl Engine {
             FeedMode::Live
         };
         let window = self.started.elapsed().as_secs_f64().max(1.0);
+        let (p50, _, p99, p999) = self.pipe_hist.percentiles_us();
+        let (w50, _, w99, _) = self.wire_hist.percentiles_us();
         EngineStats {
             ts_ms: now_ms(),
             uptime_s: self.started.elapsed().as_secs(),
@@ -794,6 +829,16 @@ impl Engine {
             engine_loop_us_ewma: self.loop_us_ewma,
             msgs_total: self.msgs_total.load(Ordering::Relaxed),
             msg_rate: self.msgs_total.load(Ordering::Relaxed) as f64 / window,
+            pipe_p50_us: p50,
+            pipe_p99_us: p99,
+            pipe_p999_us: p999,
+            wire_p50_us: w50,
+            wire_p99_us: w99,
+            broadcast_ms: self.cfg.broadcast_ms,
+            sweep_ms: self.cfg.sweep_ms,
+            multihop_routes: self.multihop.len() as u32,
+            holds_tracked: self.holds.len() as u32,
+            ga_generation: self.ga_view.generation,
         }
     }
 
@@ -830,19 +875,273 @@ impl Engine {
             venues,
             spots,
             opportunities: opps,
+            holds: self.holds.snapshot(),
+            multihop: self.multihop.clone(),
         };
         self.snapshot.store(Arc::new(snap));
     }
 
-    fn broadcast(&self, msg: ServerMsg) {
+    fn broadcast(&mut self, msg: ServerMsg) {
+        let t0 = Instant::now();
         if let Ok(txt) = serde_json::to_string(&msg) {
             let _ = self.bcast.send(Arc::new(txt));
         }
+        // Signal → wire latency, only measured when clients are attached
+        // (a no-op send would understate the serialization cost).
+        if self.bcast.receiver_count() > 0 {
+            self.wire_hist.record_us(t0.elapsed().as_micros() as f64);
+        }
     }
 
-    fn bcast_venues(&self) {
+    fn bcast_venues(&mut self) {
         let items: Vec<VenueStatus> = self.venues.values().map(|rt| rt.status.clone()).collect();
         self.broadcast(ServerMsg::Venues { items });
+    }
+
+    /// Periodic advanced-analytics pass, driven on the multi-hop cadence
+    /// (`multihop_ms`, default 250 ms):
+    ///
+    /// 1. republish the millisecond-fresh light opportunity cache the
+    ///    executor's 1 ms scan loop reads;
+    /// 2. per-opportunity analytics — Kalman spread filter on every fresh
+    ///    observation, OU half-life refits (convergence ETA), hold-to-expiry
+    ///    stats on the cheap leg, GA tape samples;
+    /// 3. multi-hop negative-cycle search over every strike family touched
+    ///    since the last pass, plus hold-lab candidate refresh;
+    /// 4. broadcast the results as dedicated WS messages.
+    fn analytics_pass(&mut self) {
+        let now = now_ms();
+        let ga = self.ga_view;
+
+        // ---- 1. light opps cache for the executor's 1 ms loop -------------
+        let mut light: Vec<Opportunity> = Vec::with_capacity(self.opps.len());
+        for st in self.opps.values() {
+            let mut o = st.opp.clone();
+            o.history = None;
+            o.hist_pt = None;
+            light.push(o);
+        }
+        light.sort_by(|a, b| b.net_vp.total_cmp(&a.net_vp));
+        self.opps_light.store(Arc::new(light));
+
+        // ---- 2. per-opportunity analytics ---------------------------------
+        let mut tape: Vec<crate::ga::TapeEvent> = Vec::new();
+        let ou_due = now - self.ou_tick_ms >= self.cfg.ou_refit_ms as i64;
+        if ou_due {
+            self.ou_tick_ms = now;
+        }
+        for (id, st) in self.opps.iter_mut() {
+            // Kalman filter on each new spread observation (noise-aware TP).
+            if st.opp.updated_ms > st.last_ou_ms {
+                st.last_ou_ms = st.opp.updated_ms;
+                let (lvl, sig) = st.kalman.update(st.opp.net_vp);
+                st.opp.kalman_level_vp = Some(lvl);
+                st.opp.kalman_sigma_vp = Some(sig);
+            }
+            // OU half-life refit (convergence ETA for the detail panel).
+            if ou_due && st.hist.len() >= 16 {
+                let samples: Vec<(i64, f64)> = st.hist.iter().copied().collect();
+                if let Some(hl) = ou::half_life_s(&samples) {
+                    if hl.is_finite() && hl > 0.0 && hl < 86_400.0 * 30.0 {
+                        st.opp.conv_eta_s = Some(hl);
+                    }
+                }
+            }
+            // Hold-to-expiry view of the cheap leg, throttled per opportunity.
+            if now - st.last_hold_ms >= self.cfg.holds_ms as i64
+                && st.opp.buy_px_usd.is_some()
+            {
+                st.last_hold_ms = now;
+                st.opp.hold = Some(crate::hold::hold_stats_for_opp(
+                    st.opp.spot,
+                    st.opp.strike,
+                    st.opp.t_years,
+                    st.opp.right == ivarb_protocol::Right::Call,
+                    st.opp.buy_px_usd.unwrap_or(0.0) / st.opp.contract_size.max(1e-9),
+                    st.opp.fee_vp,
+                    st.opp.vega_vp_usd / st.opp.contract_size.max(1e-9),
+                    ((st.opp.iv_buy_vp + st.opp.iv_sell_vp) * 0.5 / 100.0).max(1e-3),
+                    st.opp.contract_size,
+                ));
+            }
+            // GA tape sample (≤ 1 per 2 s per episode keeps the tape compact).
+            if now - st.last_tape_ms >= 2_000 && !st.opp.retired {
+                st.last_tape_ms = now;
+                tape.push(crate::ga::TapeEvent::Sample {
+                    id: id.clone(),
+                    s: crate::ga::TapeSample {
+                        t_ms: now,
+                        net_vp: st.opp.net_vp,
+                        fee_vp: st.opp.fee_vp,
+                        theta_vp_day: st.opp.theta_vp_day,
+                        dte: st.opp.dte,
+                        exec_mode: matches!(st.opp.edge_mode, EdgeMode::Exec),
+                        quote_age_ms: (now - st.opp.updated_ms).max(0) as f64,
+                        gate_base: self.cfg.min_net_vp,
+                    },
+                });
+            }
+        }
+        for ev in tape {
+            let _ = self.ga.tape_tx.send(ev);
+        }
+
+        // ---- 3. family scan: multi-hop routes + hold candidates ------------
+        // Chunked: at most ANALYTICS_FAMILIES_PER_PASS strike families are
+        // re-scanned per pass (the rest stay dirty for the next one) so the
+        // synchronous analytics never blocks the millisecond engine loop.
+        if !self.family_dirty.is_empty() {
+            let keys: Vec<InstKey> = if self.family_dirty.len() > ANALYTICS_FAMILIES_PER_PASS {
+                let all: Vec<InstKey> = self.family_dirty.drain().collect();
+                for k in &all[ANALYTICS_FAMILIES_PER_PASS..] {
+                    self.family_dirty.insert(*k);
+                }
+                all[..ANALYTICS_FAMILIES_PER_PASS].to_vec()
+            } else {
+                self.family_dirty.drain().collect()
+            };
+            let params = multihop::MultihopParams {
+                fee_buffer: ga.mh_fee_buffer(),
+                ..Default::default()
+            };
+            let mut routes: Vec<MultiHopRoute> = Vec::new();
+            let und_names: Vec<String> = {
+                let ig = self.interner.lock();
+                match ig {
+                    Ok(i) => i.names.clone(),
+                    Err(_) => Vec::new(),
+                }
+            };
+            for key in keys {
+                let sib = InstKey {
+                    und: key.und,
+                    date: key.date,
+                    strike_ticks: key.strike_ticks,
+                    right: if key.right == crate::key::RIGHT_CALL {
+                        crate::key::RIGHT_PUT
+                    } else {
+                        crate::key::RIGHT_CALL
+                    },
+                };
+                let call_key = if key.right == crate::key::RIGHT_CALL {
+                    key
+                } else {
+                    sib
+                };
+                let expiry = match ymd_to_expiry_ms(key.date) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if expiry <= now {
+                    continue;
+                }
+                let und_name = und_names
+                    .get(key.und as usize)
+                    .cloned()
+                    .unwrap_or_else(|| "?".into());
+                let spot = self
+                    .consensus
+                    .get(&und_name)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        self.venues
+                            .values()
+                            .find_map(|rt| rt.quotes.get(&key).and_then(|q| q.spot))
+                            .unwrap_or(0.0)
+                    });
+                if spot <= 0.0 {
+                    continue;
+                }
+
+                // Gather per-venue call/put legs (fresh only).
+                let mut call_legs: Vec<multihop::VenueLeg> = Vec::with_capacity(8);
+                let mut put_legs: Vec<multihop::VenueLeg> = Vec::with_capacity(8);
+                let mut hold_call: Vec<(&str, f64, f64, &LegQuote)> = Vec::with_capacity(8);
+                let mut hold_put: Vec<(&str, f64, f64, &LegQuote)> = Vec::with_capacity(8);
+                for rt in self.venues.values() {
+                    if rt.status.state == ConnState::Disabled || rt.fatal {
+                        continue;
+                    }
+                    let vid = rt.spec.id.as_str();
+                    let fee = rt.spec.taker_fee_rate;
+                    let cs = rt.spec.contract_size;
+                    if let Some(q) = rt.quotes.get(&call_key) {
+                        if now - q.recv_ms <= self.cfg.stale_ms {
+                            call_legs.push(multihop::VenueLeg {
+                                venue: vid,
+                                fee_rate: fee,
+                                contract_size: cs,
+                                quote: q,
+                            });
+                            hold_call.push((vid, fee, cs, q));
+                        }
+                    }
+                    if let Some(q) = rt.quotes.get(&sib) {
+                        if now - q.recv_ms <= self.cfg.stale_ms {
+                            put_legs.push(multihop::VenueLeg {
+                                venue: vid,
+                                fee_rate: fee,
+                                contract_size: cs,
+                                quote: q,
+                            });
+                            hold_put.push((vid, fee, cs, q));
+                        }
+                    }
+                }
+                if call_legs.len() + put_legs.len() < 2 {
+                    continue;
+                }
+
+                // Multi-hop negative-cycle search on this strike family.
+                if call_legs.len() + put_legs.len() >= 2 {
+                    let fams = multihop::build_families(&call_legs, &put_legs);
+                    let found = multihop::scan_family(
+                        &call_key,
+                        &fams,
+                        spot,
+                        now,
+                        self.cfg.stale_ms,
+                        &params,
+                        &und_name,
+                        self.cfg.multihop_max_units,
+                    );
+                    routes.extend(found);
+                }
+
+                // Hold-lab candidates (near-miss divergences below the gate).
+                self.holds
+                    .refresh(&call_key, &und_name, &hold_call, spot, expiry, now, self.cfg.stale_ms);
+                self.holds
+                    .refresh(&sib, &und_name, &hold_put, spot, expiry, now, self.cfg.stale_ms);
+            }
+            // Merge: routes from families NOT re-scanned this pass survive
+            // (their quotes are unchanged or will be refreshed on a later
+            // pass), families that were re-scanned get their routes replaced.
+            let mut scanned: FxHashSet<String> = FxHashSet::default();
+            let mut merged: Vec<MultiHopRoute> = Vec::with_capacity(routes.len() + 8);
+            for r in routes {
+                scanned.insert(r.id.split(":MH").next().unwrap_or("").to_string());
+                merged.push(r);
+            }
+            for old_r in self.multihop.drain(..) {
+                let fam = old_r.id.split(":MH").next().unwrap_or("").to_string();
+                if !scanned.contains(&fam) {
+                    merged.push(old_r);
+                }
+            }
+            merged.sort_by(|a, b| b.profit_unit_usd.total_cmp(&a.profit_unit_usd));
+            merged.truncate(60);
+            self.multihop = merged;
+            let items = self.multihop.clone();
+            self.broadcast(ServerMsg::Multihop { items });
+        }
+
+        // Hold-lab housekeeping + publish.
+        self.holds.housekeeping(now, self.cfg.stale_ms);
+        if !self.holds.is_empty() {
+            let items = self.holds.snapshot();
+            self.broadcast(ServerMsg::Holds { items });
+        }
     }
 
     /// Replace the watched-instrument set published for the advantage taker.
@@ -936,8 +1235,9 @@ fn opp_tier_stamp(
     core: &OppCore,
     cfg: &EngineConfig,
     now: i64,
+    ga: &GenomeView,
 ) -> crate::timing::StrategyView {
-    let v = core.strategy_view(cfg, 0.0, now);
+    let v = core.strategy_view_ga(cfg, 0.0, now, ga);
     opp.tier = v.tier;
     opp.bucket = v.bucket.label().to_string();
     opp.dte = v.dte;

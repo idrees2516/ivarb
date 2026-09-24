@@ -155,13 +155,17 @@ impl Kalman1 {
 mod tests {
     use super::*;
 
-    /// Generate an AR(1) series with known half-life.
+    /// Generate an AR(1) series with known half-life and iid noise.
     fn ar1_series(phi: f64, n: usize, step_ms: i64) -> Vec<(i64, f64)> {
+        ar1_series_seeded(42, phi, n, step_ms)
+    }
+
+    fn ar1_series_seeded(seed: u64, phi: f64, n: usize, step_ms: i64) -> Vec<(i64, f64)> {
+        let mut rng = ivarb_quant::Rng::new(seed);
         let mut s = 1.0;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            // Simple deterministic noise (alternating ±).
-            let noise = if i % 2 == 0 { 0.02 } else { -0.02 } * (i % 3) as f64;
+            let noise = rng.next_normal() * 0.05;
             s = phi * s + noise;
             out.push((i as i64 * step_ms, s));
         }
@@ -171,11 +175,22 @@ mod tests {
     #[test]
     fn recovers_half_life_within_tolerance() {
         // φ = 0.99 per 1 s sample → half-life = ln2 / −ln(0.99) ≈ 68.97 steps ≈ 69 s.
-        let series = ar1_series(0.99, 600, 1000);
-        let hl = half_life_s(&series).expect("fit");
+        // The OLS estimate has SE ≈ 12 s at this φ, so average four
+        // independent series to bring the estimator noise well inside the
+        // 25 % tolerance (mean estimate ≈ 65 s after the small Hurwicz bias).
+        let est: f64 = [42u64, 43, 44, 45]
+            .iter()
+            .filter_map(|&seed| {
+                let series = ar1_series_seeded(seed, 0.99, 6_000, 1000);
+                half_life_s(&series)
+            })
+            .collect::<Vec<_>>()
+            .iter()
+            .sum::<f64>()
+            / 4.0;
         assert!(
-            (hl - 69.0).abs() / 69.0 < 0.25,
-            "half life {hl} vs ~69"
+            (est - 69.0).abs() / 69.0 < 0.25,
+            "half life {est} vs ~69"
         );
     }
 

@@ -75,6 +75,8 @@ pub fn DetailPanel() -> impl IntoView {
 
                             <ExecPlan o=o.clone()/>
 
+                            <HoldBlock o=o.clone()/>
+
                             <div class="detail-grid">
                                 <div class="detail-chart">
                                     <div class="dc-title">
@@ -177,6 +179,76 @@ fn fmt_secs(s: f64) -> String {
         format!("{:.0}m", s / 60.0)
     } else {
         format!("{:.1}h", s / 3600.0)
+    }
+}
+
+/// The hold-to-expiry view of the selected opportunity's cheap leg: the
+/// "arb is good — but what if I just kept the option?" alternative, with
+/// theta cost, EV, P(profit) and the OU convergence ETA.
+#[component]
+fn HoldBlock(o: Opportunity) -> impl IntoView {
+    let hold = o.hold;
+    let eta = o.conv_eta_s;
+    let kalman = (o.kalman_level_vp, o.kalman_sigma_vp);
+    view! {
+        <div class="hold-block">
+            <div class="ep-head">
+                <h4>"Alternative: keep the cheap leg to expiry"</h4>
+                <span class="ep-sub">"the cost and profit of NOT round-tripping this trade"</span>
+            </div>
+            {match hold {
+                None => view! {
+                    <p class="dim">"Hold analytics not yet computed for this signal — it refreshes on the analytics cadence."</p>
+                }.into_any(),
+                Some(h) => {
+                    let verdict = if h.ev_usd > 0.0 {
+                        format!(
+                            "Keeping the {} leg instead of selling it away has an expected value of {} per contract under the mid-IV forecast ({:+.2} vp vol edge). The cost side: {} of theta per day and up to {} of extrinsic bleed if the market sits still. P(finishing profitable): {:.0}%.",
+                            o.buy_venue, fmt::fmt_usd(h.ev_usd), h.iv_edge_vp,
+                            fmt::fmt_usd(-h.theta_day_usd), fmt::fmt_usd(-h.extrinsic_usd),
+                            h.p_profit * 100.0,
+                        )
+                    } else {
+                        format!(
+                            "Holding to expiry is NOT attractive here: expected value {} per contract, theta bleeds {} per day. The two-leg arb captures the edge now and nets the theta — take the round trip.",
+                            fmt::fmt_usd(h.ev_usd), fmt::fmt_usd(-h.theta_day_usd),
+                        )
+                    };
+                    let cells: Vec<(&'static str, String, &'static str)> = vec![
+                        ("hold EV / ct", fmt::fmt_usd(h.ev_usd), if h.ev_usd >= 0.0 { "pos" } else { "neg" }),
+                        ("vol edge", format!("{:+.2} vp", h.iv_edge_vp), if h.iv_edge_vp >= 0.0 { "pos" } else { "neg" }),
+                        ("theta / day", format!("\u{2212}{}", fmt::fmt_usd(-h.theta_day_usd)), "neg"),
+                        ("extrinsic / ct", fmt::fmt_usd(h.extrinsic_usd), ""),
+                        ("P(profit)", format!("{:.0}%", h.p_profit * 100.0), ""),
+                        ("days to expiry", format!("{:.1}", h.dte), ""),
+                        (
+                            "convergence ETA (OU)",
+                            eta.map(|e| fmt_secs(e)).unwrap_or_else(|| "fitting…".into()),
+                            "",
+                        ),
+                        (
+                            "spread noise (Kalman σ)",
+                            kalman.1.map(|s| format!("{:.2} vp", s)).unwrap_or_else(|| "—".into()),
+                            "",
+                        ),
+                    ];
+                    view! {
+                        <p class="trade-desc">{verdict}</p>
+                        <div class="ep-grid">
+                            <For each=move || cells.clone() key=|(k, _, _)| *k let:c>
+                                {let (k, v, cls) = c;
+                                 view! {
+                                    <div class="ep-cell">
+                                        <div class="fact-k">{k}</div>
+                                        <div class=move || format!("fact-v {}", cls)>{v}</div>
+                                    </div>
+                                 }}
+                            </For>
+                        </div>
+                    }.into_any()
+                }
+            }}
+        </div>
     }
 }
 

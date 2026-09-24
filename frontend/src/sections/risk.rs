@@ -41,7 +41,7 @@ const RISKS: &[(&str, &str, &str, &str)] = &[
 pub fn RiskSection() -> impl IntoView {
     view! {
         <section class="section" id="risk">
-            <SectionHead num="06" title="Risk & reality check"
+            <SectionHead num="09" title="Risk & reality check"
                 sub="IV arb is not free money. These are the failure modes you need to have a plan for before entering any trade."/>
             <div class="risk-grid">
                 {RISKS.iter().map(|(sev, title, body, cls)| {

@@ -178,11 +178,28 @@ fn replay(eps: &[Episode], g: &Genome) -> ReplayResult {
         for s in &ep.samples {
             let hour = ((s.t_ms / 3_600_000).rem_euclid(24)) as f64;
             if let Some(en) = entry {
-                // Exit condition: spread fell to exit fraction of entry edge.
+                // Exit model. Two distinct bands:
+                //
+                // - `noise_band` (2σ-ish, ~fees + quote flicker): a spread
+                //   inside this band is NOT a confirmed convergence — the
+                //   executor's noise-aware take-profit refuses to bank on
+                //   flicker, so the replay holds on instead of exiting.
+                // - `collapse_floor`: below this the quote has collapsed
+                //   through zero-ish — phantom convergence. Exiting there is
+                //   a forced unwind at market: pay the fees plus slippage.
                 let exit_level = en.net_vp * g[G_EXIT_MULT];
                 let held_ms = (s.t_ms - en.t_ms) as f64;
-                if s.net_vp <= exit_level || held_ms >= patience_ms || s.quote_age_ms > g[G_STALE_CAP_MS] * 10.0 {
-                    let captured = (en.net_vp - s.net_vp) - s.fee_vp * fee_buf;
+                let noise_band = 0.15 + 1.5 * s.fee_vp;
+                let collapse_floor = 0.10 + 0.8 * s.fee_vp;
+                let converged = s.net_vp <= exit_level && s.net_vp > noise_band;
+                let forced =
+                    held_ms >= patience_ms || s.quote_age_ms > g[G_STALE_CAP_MS] * 10.0;
+                if converged || forced {
+                    let captured = if s.net_vp >= collapse_floor {
+                        (en.net_vp - s.net_vp) - s.fee_vp * fee_buf
+                    } else {
+                        -(s.fee_vp * fee_buf + 0.3)
+                    };
                     let held_days = held_ms / 86_400_000.0;
                     let theta_burn = en.theta_vp_day * held_days * theta_net;
                     let p_fill = if en.quote_age_ms < g[G_STALE_CAP_MS] { 0.78 } else { 0.5 };
@@ -203,10 +220,16 @@ fn replay(eps: &[Episode], g: &Genome) -> ReplayResult {
                 }
             }
         }
-        // Episode ended with an open trade → forced exit at the last sample.
+        // Episode ended with an open trade → forced exit at the last sample
+        // (same collapse-floor classification as the in-episode exit).
         if let Some(en) = entry {
             if let Some(last) = ep.samples.back() {
-                let captured = (en.net_vp - last.net_vp) - last.fee_vp * fee_buf - 0.15;
+                let collapse_floor = 0.10 + 0.8 * last.fee_vp;
+                let captured = if last.net_vp >= collapse_floor {
+                    (en.net_vp - last.net_vp) - last.fee_vp * fee_buf - 0.15
+                } else {
+                    -(last.fee_vp * fee_buf + 0.3)
+                };
                 pnl += captured;
                 trades += 1;
             }
@@ -349,6 +372,7 @@ fn run(
     let mut running = true;
 
     let mut last_gen = Instant::now();
+    let mut last_refresh = Instant::now();
     loop {
         // ---- drain commands ----
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -504,13 +528,16 @@ fn run(
             }));
             // The applied flag gates live use; when on, the published genome
             // is the best of the latest generation.
-        } else if last_gen.elapsed() >= Duration::from_millis(gen_ms.max(500)) {
-            last_gen = Instant::now();
-            // Not enough tape yet — still refresh timestamps.
+        } else if last_refresh.elapsed() >= Duration::from_millis(500) {
+            // Lightweight status refresh at 2 Hz — keeps Pause/Resume/Apply
+            // responsive without resetting the generation clock (a paused
+            // optimizer must show PAUSED immediately, not one gen later).
+            last_refresh = Instant::now();
             let cur = shared.load();
             let mut st = cur.status.clone();
             st.t_ms = now_ms();
             st.running = running;
+            st.applied = applied.load(Ordering::Relaxed);
             st.tape_episodes = episodes.len() as u32;
             st.gen_ms = gen_ms;
             let genome = cur.genome;

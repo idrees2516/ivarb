@@ -438,7 +438,7 @@ mod tests {
         let nearest = SPOT_GRID
             .iter()
             .enumerate()
-            .min_by(|(_, x), (_, y)| (x - be_m).abs().partial_cmp(&(y - be_m).abs()).unwrap())
+            .min_by(|(_, x), (_, y)| (**x - be_m).abs().partial_cmp(&(**y - be_m).abs()).unwrap())
             .map(|(i, _)| i)
             .unwrap();
         let _ = nearest; // grid is coarse; just ensure monotone payoff

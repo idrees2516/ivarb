@@ -9,8 +9,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use ivarb_protocol::{
-    EngineStats, ExecCommand, ExecSnapshot, HistoryPt, Opportunity, ServerMsg, SpotQuote,
-    VenueStatus,
+    EngineStats, ExecCommand, ExecSnapshot, GaCommand, GaStatus, HistoryPt, HoldCandidate,
+    MultiHopRoute, Opportunity, ServerMsg, SpotQuote, VenueStatus,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,7 @@ pub enum UndFilter {
     All,
     Btc,
     Eth,
+    Sol,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,7 +47,15 @@ pub struct ApiState {
     pub stats: RwSignal<Option<EngineStats>>,
     pub spots: RwSignal<Vec<SpotQuote>>,
     pub exec: RwSignal<Option<ExecSnapshot>>,
+    /// Hold-to-expiry lab candidates (near-miss divergences below the gate).
+    pub holds: RwSignal<Vec<HoldCandidate>>,
+    /// Live multi-hop arbitrage routes.
+    pub multihop: RwSignal<Vec<MultiHopRoute>>,
+    /// Genetic-optimizer status.
+    pub ga: RwSignal<Option<GaStatus>>,
     pub selected: RwSignal<Option<String>>,
+    /// Selected hold-lab candidate (inst id).
+    pub selected_hold: RwSignal<Option<String>>,
     pub sort: RwSignal<SortMode>,
     pub und_filter: RwSignal<UndFilter>,
     pub ws_state: RwSignal<WsState>,
@@ -90,7 +99,11 @@ impl ApiState {
             stats: RwSignal::new(None),
             spots: RwSignal::new(Vec::new()),
             exec: RwSignal::new(None),
+            holds: RwSignal::new(Vec::new()),
+            multihop: RwSignal::new(Vec::new()),
+            ga: RwSignal::new(None),
             selected: RwSignal::new(None),
+            selected_hold: RwSignal::new(None),
             sort: RwSignal::new(SortMode::Newest),
             und_filter: RwSignal::new(UndFilter::All),
             ws_state: RwSignal::new(WsState::Connecting),
@@ -115,6 +128,18 @@ impl ApiState {
         });
     }
 
+    /// POST a command to the genetic optimizer (fire-and-forget with a flash).
+    pub fn send_ga_cmd(&self, cmd: GaCommand, label: String) {
+        let flash = self.flash;
+        spawn_local(async move {
+            match post_json("/api/ga/cmd", &cmd).await {
+                true => flash.set(Some(label)),
+                false => flash.set(Some(format!("{label} — optimizer unreachable"))),
+            }
+            set_timeout(4000, move || flash.set(None));
+        });
+    }
+
     fn start_ticker(&self) {
         let set_now = self.now;
         let cb = Closure::wrap(Box::new(move || {
@@ -133,6 +158,9 @@ impl ApiState {
         let (venues, set_venues) = (self.venues, self.venues.write_only());
         let (stats, set_stats) = (self.stats, self.stats.write_only());
         let (spots, set_spots) = (self.spots, self.spots.write_only());
+        let (_holds, set_holds) = (self.holds, self.holds.write_only());
+        let (_mh, set_multihop) = (self.multihop, self.multihop.write_only());
+        let (_ga, set_ga) = (self.ga, self.ga.write_only());
         let (ws_state, set_ws_state) = (self.ws_state, self.ws_state.write_only());
 
         let ws = match web_sys::WebSocket::new(&ws_url()) {
@@ -172,6 +200,8 @@ impl ApiState {
                         set_stats.set(Some(snapshot.stats));
                         set_venues.set(snapshot.venues);
                         set_spots.set(snapshot.spots);
+                        set_holds.set(snapshot.holds);
+                        set_multihop.set(snapshot.multihop);
                         let mut hm: HashMap<String, Vec<HistoryPt>> = HashMap::new();
                         for o in &snapshot.opportunities {
                             if let Some(h) = &o.history {
@@ -222,6 +252,9 @@ impl ApiState {
                     ServerMsg::Stats { stats } => set_stats.set(Some(stats)),
                     ServerMsg::Spots { items } => set_spots.set(items),
                     ServerMsg::Exec { exec } => set_exec.set(Some(exec)),
+                    ServerMsg::Holds { items } => set_holds.set(items),
+                    ServerMsg::Multihop { items } => set_multihop.set(items),
+                    ServerMsg::Ga { status } => set_ga.set(Some(status)),
                 }
             }) as Box<dyn FnMut(web_sys::MessageEvent)>);
             ws.set_onmessage(Some(cb.as_ref().unchecked_ref()));

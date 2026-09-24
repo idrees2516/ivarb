@@ -59,22 +59,8 @@ impl Default for MultihopParams {
 const MAX_ROUTES_PER_FAMILY: usize = 4;
 const MAX_HOPS: usize = 6;
 const MIN_PROFIT_UNIT_USD: f64 = 0.5;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Node {
-    Cash,
-    /// Venue index × right.
-    Inst(usize, u8),
-}
-
-struct Edge {
-    from: Node,
-    to: Node,
-    /// USD cost per unit (negative = gain).
-    cost: f64,
-    /// Index into the leg template list for route reconstruction.
-    leg: usize,
-}
+/// Hard bound on DFS steps per family (safety valve for wide books).
+const MAX_WALK_STEPS: usize = 20_000;
 
 struct LegTemplate {
     action: &'static str,
@@ -83,19 +69,14 @@ struct LegTemplate {
     px_unit: f64,
     fee_unit: f64,
     size_units: f64,
+    /// Net cash outflow per unit for this leg (negative = receive).
+    cost: f64,
 }
 
 /// Node indexing: 0 = cash, 1 + vi*2 + right.
 #[inline]
-fn node_inst(vi: usize, right: u8) -> Node {
-    Node::Inst(vi, right)
-}
-#[inline]
-fn node_idx(n: Node, n_venues: usize) -> usize {
-    match n {
-        Node::Cash => 0,
-        Node::Inst(vi, r) => 1 + vi * 2 + r as usize,
-    }
+fn cell_of(vi: usize, right: u8) -> usize {
+    vi * 2 + right as usize
 }
 
 /// Detect profitable routes for one strike family.
@@ -126,24 +107,22 @@ pub fn scan_family(
         return Vec::new();
     }
     let n_venues = live.len();
-    let n_nodes = 1 + n_venues * 2;
-
-    // ---- build the edge set with leg templates ------------------------------
-    let mut edges: Vec<Edge> = Vec::with_capacity(n_venues * 10);
+    // ---- build the leg-template set -----------------------------------------
+    // Each template is one executable trade; `cost` is the net cash outflow
+    // per underlying unit (negative = receive). The search below walks an
+    // inventory vector (one cell per (venue, right), each in -1..=+1) and
+    // records every combination that is flat at expiry with positive cash.
     let mut legs: Vec<LegTemplate> = Vec::with_capacity(n_venues * 10);
 
     let opt_fee = |rate: f64| (rate * params.fee_buffer).mul_add(spot, 0.0);
-    let push = |edges: &mut Vec<Edge>,
-                legs: &mut Vec<LegTemplate>,
-                from: Node,
-                to: Node,
-                cost: f64,
-                action: &'static str,
-                venue_idx: usize,
-                right: u8,
-                px_unit: f64,
-                fee_unit: f64,
-                size_units: f64| {
+    let mut push = |legs: &mut Vec<LegTemplate>,
+                    action: &'static str,
+                    venue_idx: usize,
+                    right: u8,
+                    px_unit: f64,
+                    fee_unit: f64,
+                    size_units: f64,
+                    cost: f64| {
         legs.push(LegTemplate {
             action,
             venue_idx,
@@ -151,12 +130,7 @@ pub fn scan_family(
             px_unit,
             fee_unit,
             size_units,
-        });
-        edges.push(Edge {
-            from,
-            to,
             cost,
-            leg: legs.len() - 1,
         });
     };
 
@@ -166,20 +140,12 @@ pub fn scan_family(
             if let Some(ask) = c.px_ask_unit.filter(|p| *p > 0.0) {
                 let fee = opt_fee(q.fee_rate);
                 let sz = c.size_ask.unwrap_or(0.0).min(min_size_units).max(0.0);
-                push(
-                    &mut edges, &mut legs,
-                    Node::Cash, node_inst(vi, 0),
-                    ask + fee, "buy", vi, 0, ask, fee, sz,
-                );
+                push(&mut legs, "buy", vi, 0, ask, fee, sz, ask + fee);
             }
             if let Some(bid) = c.px_bid_unit.filter(|p| *p > 0.0) {
                 let fee = opt_fee(q.fee_rate);
                 let sz = c.size_bid.unwrap_or(0.0).min(min_size_units).max(0.0);
-                push(
-                    &mut edges, &mut legs,
-                    node_inst(vi, 0), Node::Cash,
-                    -(bid - fee), "sell", vi, 0, bid, fee, sz,
-                );
+                push(&mut legs, "sell", vi, 0, bid, fee, sz, -(bid - fee));
             }
         }
         // Buy / sell the PUT on this venue.
@@ -187,114 +153,57 @@ pub fn scan_family(
             if let Some(ask) = p.px_ask_unit.filter(|p| *p > 0.0) {
                 let fee = opt_fee(q.fee_rate);
                 let sz = p.size_ask.unwrap_or(0.0).min(min_size_units).max(0.0);
-                push(
-                    &mut edges, &mut legs,
-                    Node::Cash, node_inst(vi, 1),
-                    ask + fee, "buy", vi, 1, ask, fee, sz,
-                );
+                push(&mut legs, "buy", vi, 1, ask, fee, sz, ask + fee);
             }
             if let Some(bid) = p.px_bid_unit.filter(|p| *p > 0.0) {
                 let fee = opt_fee(q.fee_rate);
                 let sz = p.size_bid.unwrap_or(0.0).min(min_size_units).max(0.0);
-                push(
-                    &mut edges, &mut legs,
-                    node_inst(vi, 1), Node::Cash,
-                    -(bid - fee), "sell", vi, 1, bid, fee, sz,
-                );
+                push(&mut legs, "sell", vi, 1, bid, fee, sz, -(bid - fee));
             }
         }
-        // Parity conversions (call ↔ put on the same venue). The forward
+        // Parity conversions (call <-> put on the same venue). The forward
         // difference is carried in a perp hedge: 2 hedge trades per conversion.
+        // The template's `right` is the right ACQUIRED by the conversion.
         if let (Some(c), Some(p)) = (q.call, q.put) {
             let hedge_fee = 2.0 * params.hedge_fee_rate * spot * params.fee_buffer;
             let extra = params.conversion_cost_unit;
-            // Long call → long put: sell call at bid, buy put at ask.
+            // Long call -> long put: sell call at bid, buy put at ask.
             if let (Some(cb), Some(pa)) = (
                 c.px_bid_unit.filter(|x| *x > 0.0),
                 p.px_ask_unit.filter(|x| *x > 0.0),
             ) {
                 let sz = c.size_bid.unwrap_or(0.0).min(p.size_ask.unwrap_or(0.0)).min(min_size_units).max(0.0);
-                push(
-                    &mut edges, &mut legs,
-                    node_inst(vi, 0), node_inst(vi, 1),
-                    pa - cb + hedge_fee + extra, "convert", vi, 1, pa - cb, hedge_fee + extra, sz,
-                );
+                push(&mut legs, "convert", vi, 1, pa - cb, hedge_fee + extra, sz, pa - cb + hedge_fee + extra);
             }
-            // Long put → long call: sell put at bid, buy call at ask.
+            // Long put -> long call: sell put at bid, buy call at ask.
             if let (Some(pb), Some(ca)) = (
                 p.px_bid_unit.filter(|x| *x > 0.0),
                 c.px_ask_unit.filter(|x| *x > 0.0),
             ) {
                 let sz = p.size_bid.unwrap_or(0.0).min(c.size_ask.unwrap_or(0.0)).min(min_size_units).max(0.0);
-                push(
-                    &mut edges, &mut legs,
-                    node_inst(vi, 1), node_inst(vi, 0),
-                    ca - pb + hedge_fee + extra, "convert", vi, 0, ca - pb, hedge_fee + extra, sz,
-                );
+                push(&mut legs, "convert", vi, 0, ca - pb, hedge_fee + extra, sz, ca - pb + hedge_fee + extra);
             }
         }
     }
 
-    if edges.is_empty() {
+    if legs.is_empty() {
         return Vec::new();
     }
-    let mut path: Vec<usize> = Vec::with_capacity(MAX_HOPS);
-    let mut on_path = vec![false; n_nodes];
 
-    // ---- enumerate profitable cycles through CASH ----------------------------
-    // Iterative DFS over simple paths from cash back to cash. The family
-    // graph has ≤ 17 nodes and ≤ ~60 edges, so bounded DFS is both exhaustive
-    // and fast (microseconds).
+    // ---- enumerate flat, cash-positive leg combinations ----------------------
+    // Inventory walk: a route is a set of legs (in canonical template order)
+    // whose net position is flat AT EXPIRY - same-venue cells must return to
+    // zero, and cross-venue longs/shorts of the same right settle against each
+    // other (buy call @okx + sell call @bybit is flat at expiry because both
+    // legs pay the same terminal payoff). Every cell stays within -1..=+1.
     let mut found_routes: Vec<(f64, Vec<usize>)> = Vec::new();
     {
-        struct Frame {
-            node: usize,
-            edge_iter: usize,
-            acc: f64,
-        }
-        let mut stack: Vec<Frame> = vec![Frame {
-            node: 0,
-            edge_iter: 0,
-            acc: 0.0,
-        }];
-        while let Some(f) = stack.last_mut() {
-            if f.edge_iter >= edges.len() || stack.len() > MAX_HOPS {
-                stack.pop();
-                if let Some(pi) = path.pop() {
-                    let e = &edges[pi];
-                    let to = node_idx(e.to, n_venues);
-                    on_path[to] = false;
-                }
-                continue;
-            }
-            let ei = f.edge_iter;
-            f.edge_iter += 1;
-            let e = &edges[ei];
-            let from = node_idx(e.from, n_venues);
-            let to = node_idx(e.to, n_venues);
-            if from != f.node {
-                continue;
-            }
-            if e.to != Node::Cash && on_path[to] {
-                continue;
-            }
-            let new_acc = f.acc + e.cost;
-            path.push(ei);
-            if e.to == Node::Cash {
-                let profit = -new_acc;
-                if profit > MIN_PROFIT_UNIT_USD && path.len() >= 2 {
-                    found_routes.push((profit, path.clone()));
-                }
-                path.pop();
-                continue;
-            }
-            on_path[to] = true;
-            stack.push(Frame {
-                node: to,
-                edge_iter: 0,
-                acc: new_acc,
-            });
-        }
+        let mut inv = vec![0i8; n_venues * 2];
+        let mut path: Vec<usize> = Vec::with_capacity(MAX_HOPS);
+        let mut steps: usize = 0;
+        walk_flat(
+            &legs, n_venues, &mut inv, 0.0, &mut path, 0, &mut steps, &mut found_routes,
+        );
     }
 
     if found_routes.is_empty() {
@@ -366,7 +275,7 @@ pub fn scan_family(
                 chain.join(">")
             ),
             underlying: und_name.to_string(),
-            expiry,
+            expiry: expiry.clone(),
             strike,
             legs: wire_legs,
             profit_unit_usd: profit,
@@ -378,6 +287,90 @@ pub fn scan_family(
         });
     }
     routes
+}
+
+/// Depth-first inventory walk over leg templates in canonical
+/// (strictly template-index-increasing) order.
+///
+/// `inv` holds one cell per (venue, right); each cell stays within -1..=+1.
+/// A combination is recorded when it is flat at expiry - i.e. the cross-venue
+/// sum per right is zero (same-venue positions cancel trivially; long on one
+/// venue settles against a short on another because both legs reference the
+/// same strike/expiry payoff) - and its total cash flow is positive.
+fn walk_flat(
+    legs: &[LegTemplate],
+    n_venues: usize,
+    inv: &mut [i8],
+    acc: f64,
+    path: &mut Vec<usize>,
+    min_ti: usize,
+    steps: &mut usize,
+    found: &mut Vec<(f64, Vec<usize>)>,
+) {
+    if *steps >= MAX_WALK_STEPS {
+        return;
+    }
+    *steps += 1;
+
+    // Flat-at-expiry check: cross-venue net per right must be zero.
+    if path.len() >= 2 {
+        let mut net_c: i32 = 0;
+        let mut net_p: i32 = 0;
+        for v in 0..n_venues {
+            net_c += inv[v * 2] as i32;
+            net_p += inv[v * 2 + 1] as i32;
+        }
+        if net_c == 0 && net_p == 0 {
+            let profit = -acc;
+            if profit > MIN_PROFIT_UNIT_USD {
+                found.push((profit, path.clone()));
+            }
+        }
+    }
+    if path.len() >= MAX_HOPS {
+        return;
+    }
+
+    for ti in min_ti..legs.len() {
+        let t = &legs[ti];
+        let cell = cell_of(t.venue_idx, t.right);
+        match t.action {
+            "buy" => {
+                // Long one more (or close a short): cell must be <= 0.
+                if inv[cell] <= 0 {
+                    inv[cell] += 1;
+                    path.push(ti);
+                    walk_flat(legs, n_venues, inv, acc + t.cost, path, ti + 1, steps, found);
+                    path.pop();
+                    inv[cell] -= 1;
+                }
+            }
+            "sell" => {
+                // Short one more (or close a long): cell must be >= 0.
+                if inv[cell] >= 0 {
+                    inv[cell] -= 1;
+                    path.push(ti);
+                    walk_flat(legs, n_venues, inv, acc + t.cost, path, ti + 1, steps, found);
+                    path.pop();
+                    inv[cell] += 1;
+                }
+            }
+            // Parity conversion on the same venue: must own the source right;
+            // the acquired right's cell must be <= 0 (buy side of conversion).
+            _ => {
+                let src = if t.right == 0 { cell_of(t.venue_idx, 1) } else { cell_of(t.venue_idx, 0) };
+                if inv[src] == 1 && inv[cell] <= 0 {
+                    inv[src] = 0;
+                    inv[cell] += 1;
+                    path.push(ti);
+                    walk_flat(legs, n_venues, inv, acc + t.cost, path, ti + 1, steps, found);
+                    path.pop();
+                    inv[cell] -= 1;
+                    inv[src] = 1;
+                }
+            }
+        }
+    }
 }
 
 /// Helper used by the engine to collect (venue, LegQuote) pairs for one key.

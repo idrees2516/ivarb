@@ -24,7 +24,7 @@ use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use ivarb_protocol::Snapshot;
+use ivarb_protocol::{Opportunity, Snapshot};
 
 pub use config::{EngineConfig, SimMode, VenueKind, VenueSpec};
 pub use engine::EngineHandles;
@@ -37,6 +37,8 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
 
     let (venue_tx, venue_rx) = mpsc::channel(4096);
     let (bcast, _) = broadcast::channel::<Arc<String>>(1024);
+    let opps_light: Arc<ArcSwap<Vec<Opportunity>>> =
+        Arc::new(ArcSwap::from_pointee(Vec::new()));
     let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot {
         ts_ms: crate::msg::now_ms(),
         stats: ivarb_protocol::EngineStats {
@@ -50,6 +52,16 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
             engine_loop_us_ewma: 0.0,
             msgs_total: 0,
             msg_rate: 0.0,
+            pipe_p50_us: 0.0,
+            pipe_p99_us: 0.0,
+            pipe_p999_us: 0.0,
+            wire_p50_us: 0.0,
+            wire_p99_us: 0.0,
+            broadcast_ms: cfg.broadcast_ms,
+            sweep_ms: cfg.sweep_ms,
+            multihop_routes: 0,
+            holds_tracked: 0,
+            ga_generation: 0,
         },
         venues: cfg
             .venues
@@ -68,6 +80,7 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
                 taker_fee_rate: v.taker_fee_rate,
                 coin_margined: v.coin_margined,
                 contract_size: v.contract_size,
+                lag_ms_ewma: 0.0,
                 note: if v.enabled {
                     None
                 } else {
@@ -77,6 +90,8 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
             .collect(),
         spots: Vec::new(),
         opportunities: Vec::new(),
+        holds: Vec::new(),
+        multihop: Vec::new(),
     }));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (sig_tx, sig_rx) = mpsc::channel::<String>(8192);
@@ -149,6 +164,7 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
         watch_rx,
         watched.clone(),
         ga.clone(),
+        opps_light.clone(),
     )
     .run());
 
@@ -232,5 +248,6 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
         watch_tx,
         watched,
         ga,
+        opps_light,
     })
 }

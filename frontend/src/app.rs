@@ -1,10 +1,11 @@
-//! App shell: header, hero, and the six numbered sections from the product
-//! spec (00 scanner · 01 reading · 02 math · 03 execution · 04 venues · 05 risk).
+//! App shell: header, hero, and the numbered sections from the product
+//! spec (00 scanner · 01 reading · 02 taker · 03 hold lab · 04 multihop
+//! · 05 genetic optimizer · 06 math · 07 execution · 08 venues · 09 risk).
 
 use leptos::prelude::*;
 
 use crate::fmt;
-use crate::sections::{calc, risk, scanner, steps, taker, venues};
+use crate::sections::{calc, ga, holdlab, multihop, risk, scanner, steps, taker, venues};
 use crate::state::{ApiState, WsState};
 
 #[component]
@@ -21,6 +22,9 @@ pub fn App() -> impl IntoView {
                 <scanner::ScannerSection/>
                 <LegendSection/>
                 <taker::TakerSection/>
+                <holdlab::HoldLabSection/>
+                <multihop::MultihopSection/>
+                <ga::GaSection/>
                 <calc::MathSection/>
                 <steps::StepsSection/>
                 <venues::VenuesSection/>
@@ -106,6 +110,43 @@ fn TopBar() -> impl IntoView {
                             format!("{:.0} µs", s.as_ref().map(|x| x.engine_loop_us_ewma).unwrap_or(0.0))
                         }
                         class_extra=|| String::new()/>
+                    <StatChip label="pipe p50/p99"
+                        value=move || {
+                            let s = stats.get();
+                            let (p50, p99) = (
+                                s.as_ref().map(|x| x.pipe_p50_us).unwrap_or(0.0),
+                                s.as_ref().map(|x| x.pipe_p99_us).unwrap_or(0.0),
+                            );
+                            if p50 > 0.0 { format!("{:.0} / {:.0} µs", p50, p99) } else { "—".into() }
+                        }
+                        class_extra=|| String::new()/>
+                    <StatChip label="wire p50/p99"
+                        value=move || {
+                            let s = stats.get();
+                            let (w50, w99) = (
+                                s.as_ref().map(|x| x.wire_p50_us).unwrap_or(0.0),
+                                s.as_ref().map(|x| x.wire_p99_us).unwrap_or(0.0),
+                            );
+                            if w50 > 0.0 { format!("{:.0} / {:.0} µs", w50, w99) } else { "—".into() }
+                        }
+                        class_extra=|| String::new()/>
+                    <StatChip label="GA"
+                        value=move || {
+                            let g = st.ga.get();
+                            match g {
+                                Some(g) if g.running => format!("gen {} · {:+.1}%", g.generation, g.improvement_pct),
+                                Some(_) => "paused".into(),
+                                None => "—".into(),
+                            }
+                        }
+                        class_extra=move || {
+                            let g = st.ga.get();
+                            match g {
+                                Some(g) if g.running && g.applied => "".to_string(),
+                                Some(_) => " amber".to_string(),
+                                None => "".to_string(),
+                            }
+                        }/>
                     <StatChip label="taker"
                         value=move || {
                             let e = exec.get();
@@ -220,14 +261,16 @@ fn Hero() -> impl IntoView {
     let spot = Memo::new(move |_| {
         let mut btc = None;
         let mut eth = None;
+        let mut sol = None;
         for s in st.spots.get() {
             match s.underlying.as_str() {
                 "BTC" => btc = Some(s.price),
                 "ETH" => eth = Some(s.price),
+                "SOL" => sol = Some(s.price),
                 _ => {}
             }
         }
-        (btc, eth)
+        (btc, eth, sol)
     });
 
     view! {
@@ -240,6 +283,8 @@ fn Hero() -> impl IntoView {
                     <span class="tag">"fee-adjusted math built in"</span>
                     <span class="tag">"auto-execution engine"</span>
                     <span class="tag">"time-aware strategies"</span>
+                    <span class="tag">"millisecond pipeline"</span>
+                    <span class="tag">"multi-hop + genetic optimizer"</span>
                 </div>
             </div>
             <div class="hero-stats">
@@ -254,14 +299,15 @@ fn Hero() -> impl IntoView {
                     sub=move || "net vp × vega, before slippage".into()/>
                 <HeroCard label="consensus spot"
                     value=move || {
-                        let (btc, eth) = spot.get();
-                        match (btc, eth) {
-                            (Some(b), Some(e)) => format!("{} / {}", fmt::fmt_spot(b), fmt::fmt_spot(e)),
-                            (Some(b), None) => fmt::fmt_spot(b),
-                            _ => "—".into(),
-                        }
+                        let (btc, eth, sol) = spot.get();
+                        let parts: Vec<String> = [btc, eth, sol]
+                            .iter()
+                            .flatten()
+                            .map(|p| fmt::fmt_spot(*p))
+                            .collect();
+                        if parts.is_empty() { "—".into() } else { parts.join(" / ") }
                     }
-                    sub=move || "median across venues".into()/>
+                    sub=move || "BTC / ETH / SOL · median across venues".into()/>
             </div>
         </section>
     }
