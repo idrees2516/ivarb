@@ -199,9 +199,21 @@ pub struct Position {
     pub exit_stop_vp: f64,
     pub theta_budget_vp: f64,
     pub max_hold_s: f64,
+    /// Best (lowest) mid spread seen since entry, vp — the anchor for the
+    /// trailing take-profit ratchet. Only ever decreases.
+    #[serde(default)]
+    pub min_spread_vp: f64,
+    /// Best (highest) unrealized P&L seen, USD — the anchor for the
+    /// USD-level profit ratchet (bank the peak's give-back before theta and
+    /// drift round-trip it). Only ever increases, only on fresh quotes.
+    #[serde(default)]
+    pub peak_unrealized_usd: f64,
     /// Residual delta hedge state (spec step 06).
     pub hedge_units: f64,
     pub hedge_avg_px: f64,
+    /// Capital reserved at entry: long premium + buffered short-leg
+    /// margin + entry fees (both venues).
+    pub capital_usd: f64,
     pub closing: bool,
 }
 
@@ -233,6 +245,10 @@ pub fn fmt_strike_id(strike: f64) -> String {
 pub enum ExitReason {
     /// Spread converged — target captured.
     TakeProfit,
+    /// Trailing lock: convergence reached ≥50% of the signal edge, then the
+    /// spread gave back more than 30% of the achieved progress — profit
+    /// banked before the bounce could take it.
+    Trail,
     /// Spread inverted beyond the stop — cut.
     Stop,
     /// Theta budget exhausted (time decay ate the expected edge).
@@ -268,6 +284,14 @@ pub struct Trade {
     /// Realized vp minus signal net vp — negative means we gave back edge.
     pub slippage_vp: f64,
     pub fees_usd: f64,
+    /// Spread premium locked at entry: (sell − buy premium) × units, USD.
+    /// The profit attribution baseline before costs and market drift.
+    pub gross_locked_usd: f64,
+    /// Market drift between entry and exit (what convergence gave or the
+    /// stop took), USD: realized − gross + fees − hedge.
+    pub exit_drift_usd: f64,
+    /// Capital the position reserved at entry (premium + margin + fees).
+    pub capital_usd: f64,
     pub hedge_pnl_usd: f64,
     pub hold_s: f64,
     pub exit_reason: ExitReason,
@@ -298,6 +322,35 @@ pub struct ExecStats {
     pub capture_ratio: f64,
     /// Trades closed this session.
     pub trades_closed: u32,
+
+    // ---- treasury & capital (funding panel) ----
+    /// Total account equity across venues (paper balances).
+    pub equity_usd: f64,
+    /// Lifetime net deposits (deposits − withdrawals).
+    pub net_deposits_usd: f64,
+    /// Capital currently reserved by open positions (entry premium +
+    /// short-leg margin + fees, marked at entry).
+    pub capital_reserved_usd: f64,
+    /// Free collateral across venues: equity − reserved.
+    pub capital_free_usd: f64,
+    /// Return on reserved capital this session: P&L / avg reserved.
+    pub roc_session_pct: f64,
+
+    // ---- profit attribution (closed trades) ----
+    /// Sum of entry-locked spread premiums across closed trades.
+    pub gross_locked_usd: f64,
+    /// Sum of market drift between entry and exit.
+    pub exit_drift_usd: f64,
+    /// Cumulative hedge P&L.
+    pub hedge_pnl_usd: f64,
+    /// Closed trades that made money.
+    pub wins: u32,
+    /// Closed trades that lost money.
+    pub losses: u32,
+    /// Gross wins / gross losses (profit factor); +inf-safe 0 when none.
+    pub profit_factor: f64,
+    /// Average realized P&L per closed trade.
+    pub avg_trade_usd: f64,
 }
 
 /// User-tunable settings (all env-overridable, UI-editable at runtime).
@@ -332,6 +385,15 @@ pub struct ExecSettings {
     pub hedge_enabled: bool,
     /// Hedge when |net delta × spot| exceeds this USD.
     pub hedge_threshold_usd: f64,
+    /// Portfolio concentration cap: max open positions + live attempts per
+    /// underlying (BTC/ETH/SOL…). Cross-venue arbs on the same underlying are
+    /// strongly correlated — one vol shock moves all of them at once.
+    #[serde(default = "default_max_per_underlying")]
+    pub max_per_underlying: u32,
+}
+
+fn default_max_per_underlying() -> u32 {
+    2
 }
 
 impl Default for ExecSettings {
@@ -353,6 +415,7 @@ impl Default for ExecSettings {
             theta_budget_frac: 0.6,
             hedge_enabled: true,
             hedge_threshold_usd: 250.0,
+            max_per_underlying: 2,
         }
     }
 }
@@ -384,9 +447,36 @@ pub struct ExecSnapshot {
     pub events: Vec<ExecEvent>,
     /// Paper balances per venue (USD-margined simulation).
     pub balances: Vec<(VenueId, f64)>,
+    /// Lifetime net deposits per venue (deposits − withdrawals).
+    pub deposits_by_venue: Vec<(VenueId, f64)>,
     /// Live-gateway readiness (env gates, session, route completeness).
     #[serde(default)]
     pub live: LiveStatus,
+    /// Route-capture calibration table (learned per venue-pair edge
+    /// multipliers; see `crates/executor/src/calib.rs`).
+    #[serde(default)]
+    pub routes: Vec<RouteStatOut>,
+}
+
+/// One venue-pair's learned execution quality — what fraction of the
+/// displayed edge the route actually banks, and how reliably attempts on it
+/// fill both legs. Published inside `ExecSnapshot` for the UI and REST.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteStatOut {
+    /// `buy_venue>sell_venue`.
+    pub route: String,
+    pub attempts: u32,
+    pub aborts: u32,
+    pub closed: u32,
+    /// EWMA of realized_vp / signal_net_vp (clamped ±5).
+    pub capture_ewma: f64,
+    /// EWMA of aborted / attempted.
+    pub abort_ewma: f64,
+    /// Learned edge multiplier applied to this route's displayed EV
+    /// (1.0 = neutral / warm-up; 0.05 = effectively refused).
+    pub edge_mult: f64,
+    /// Quote-flicker flag: abort-dominated pair, currently discounted.
+    pub flicker: bool,
 }
 
 /// Commands accepted by the advantage taker (REST → executor).
@@ -401,6 +491,10 @@ pub enum ExecCommand {
     Take { opp: String, units: Option<f64> },
     Close { position: u64 },
     FlattenAll,
+    /// Deposit paper money onto a venue (treasury funding).
+    Deposit { venue: String, amount_usd: f64 },
+    /// Withdraw paper money from a venue (refuses to overdraw).
+    Withdraw { venue: String, amount_usd: f64 },
     /// Validate the authenticated live path without placing strategy orders:
     /// checks env arming gates, connects, authenticates and reads the account
     /// summary. Safe in paper mode — it never orders.

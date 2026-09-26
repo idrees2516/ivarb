@@ -32,6 +32,7 @@ pub fn TakerSection() -> impl IntoView {
                     let s3 = s.clone();
                     let s4 = s.clone();
                     let s5 = s.clone();
+                    let s6 = s.clone();
                     view! {
                         <ControlBar s=s.clone()/>
                         <div class="taker-grid">
@@ -41,7 +42,8 @@ pub fn TakerSection() -> impl IntoView {
                             </div>
                             <div class="tk-col">
                                 <ExecLogPanel s=s4.clone()/>
-                                <StrategyMatrix s=s5.clone()/>
+                                <RouteCalibPanel s=s5.clone()/>
+                                <StrategyMatrix s=s6.clone()/>
                             </div>
                         </div>
                     }.into_any()
@@ -332,6 +334,79 @@ fn ExecLogPanel(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
 }
 
 #[component]
+fn RouteCalibPanel(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
+    let rows = s.routes.clone();
+    view! {
+        <div class="tk-panel">
+            <div class="tk-head">
+                <h3>"Route calibration"</h3>
+                <span class="tk-count">{format!("{} routes learned", rows.len())}</span>
+            </div>
+            {if rows.is_empty() {
+                view! {
+                    <div class="matrix-note">
+                        "Every venue pair carries its own reality — quote flicker, leg latency, depth
+                        shape. Each closed trade books its capture ratio (realized vs signaled edge)
+                        into a per-route EWMA; the taker then fires only when the CALIBRATED edge
+                        (displayed EV × learned multiplier) clears the bar. Warms up after the first
+                        closed trades per route."
+                    </div>
+                }.into_any()
+            } else {
+                view! {
+                    <div class="tablewrap tight">
+                        <table class="tk-table matrix">
+                            <thead><tr>
+                                <th>"Route"</th><th>"Closed"</th><th>"Capture"</th>
+                                <th>"Abort rate"</th><th>"Edge ×"</th>
+                            </tr></thead>
+                            <tbody>
+                                <For each=move || rows.clone() key=|r| r.route.clone() let: r>
+                                    <tr class:cold=r.flicker>
+                                        <td class="mono">{r.route.clone()}</td>
+                                        <td class="mono">{r.closed}</td>
+                                        <td class="mono">
+                                            <span class=cap_class(r.capture_ewma)>
+                                                {format!("{:+.0}%", r.capture_ewma * 100.0)}
+                                            </span>
+                                        </td>
+                                        <td class="mono">{format!("{:.0}%", r.abort_ewma * 100.0)}</td>
+                                        <td class="mono">
+                                            <span class=mult_class(r.edge_mult)>
+                                                {format!("×{:.2}", r.edge_mult)}
+                                            </span>
+                                            {if r.flicker {
+                                                view! { <span class="chip warn-chip rc-flick">"FLICKER"</span> }.into_any()
+                                            } else {
+                                                ().into_any()
+                                            }}
+                                        </td>
+                                    </tr>
+                                </For>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="matrix-note">
+                        "Edge × is what the route's displayed EV is worth in the account. Routes that
+                        consistently bank their edge keep ×1.0+; abort-dominated pairs (FLICKER) are
+                        discounted or skipped until their books behave. Manual takes are warned, never
+                        blocked — the human keeps the last word."
+                    </div>
+                }.into_any()
+            }}
+        </div>
+    }
+}
+
+fn cap_class(c: f64) -> &'static str {
+    if c >= 0.6 { "rc-pos" } else if c >= 0.0 { "rc-mid" } else { "rc-neg" }
+}
+
+fn mult_class(m: f64) -> &'static str {
+    if m >= 0.8 { "rc-pos" } else if m >= 0.4 { "rc-mid" } else { "rc-neg" }
+}
+
+#[component]
 fn StrategyMatrix(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
     view! {
         <div class="tk-panel">
@@ -393,7 +468,7 @@ fn level_class(l: &ExecLevel) -> &'static str {
 
 fn exit_class(r: &ExitReason) -> &'static str {
     match r {
-        ExitReason::TakeProfit => "take",
+        ExitReason::TakeProfit | ExitReason::Trail => "take",
         ExitReason::Stop | ExitReason::Killed => "stop",
         ExitReason::ThetaBudget => "theta",
         _ => "neutral",
@@ -403,6 +478,7 @@ fn exit_class(r: &ExitReason) -> &'static str {
 fn exit_label(r: &ExitReason) -> &'static str {
     match r {
         ExitReason::TakeProfit => "TAKE PROFIT",
+        ExitReason::Trail => "TRAIL LOCK",
         ExitReason::Stop => "STOP",
         ExitReason::ThetaBudget => "THETA BUDGET",
         ExitReason::MaxHold => "MAX HOLD",

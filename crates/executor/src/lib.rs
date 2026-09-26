@@ -12,6 +12,7 @@
 //! - UI state is published through ArcSwap snapshots + the shared broadcast
 //!   channel, serialized exactly once per push.
 
+pub mod calib;
 pub mod live;
 pub mod machine;
 pub mod paper;
@@ -37,6 +38,13 @@ use machine::{AttemptCtx, AttemptOutcome, PositionDraft};
 use paper::PaperBroker;
 use risk::{canonical_inst, RiskState};
 
+/// Serialized engine snapshots start with this prefix (`ServerMsg` is
+/// internally tagged) — used to detect "fresh data" on the broadcast bus
+/// without deserializing anything.
+const SNAP_PREFIX: &str = "{\"type\":\"snapshot\"";
+/// Batched opportunity deltas — the engine's ms-cadence news channel.
+const OPPS_PREFIX: &str = "{\"type\":\"opps\"";
+
 #[inline]
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,6 +61,15 @@ pub struct ExecDeps {
     pub watch_tx: mpsc::UnboundedSender<WatchCmd>,
     pub bcast: broadcast::Sender<Arc<String>>,
     pub shutdown: watch::Receiver<bool>,
+    /// Millisecond-fresh opportunity list (engine `analytics_pass` cache,
+    /// ~250 ms cadence — fresher than the 1 s full snapshot). The scan
+    /// prefers this and falls back to the snapshot's list.
+    #[allow(clippy::type_complexity)]
+    pub opps_light: Arc<ArcSwap<Vec<Opportunity>>>,
+    /// Cadences from IVARB_EXEC_* env overrides (ms; see EngineConfig).
+    pub scan_ms: u64,
+    pub monitor_ms: u64,
+    pub push_ms: u64,
 }
 
 pub struct ExecutorHandle {
@@ -69,6 +86,19 @@ struct Stats {
     trades_closed: u32,
     capture_sum: f64,
     capture_n: f64,
+    // profit attribution
+    gross_locked_usd: f64,
+    exit_drift_usd: f64,
+    hedge_pnl_usd: f64,
+    wins: u32,
+    losses: u32,
+    gross_wins: f64,
+    gross_losses: f64,
+    // capital
+    capital_reserved_usd: f64,
+    capital_peak_usd: f64,
+    reserved_time_s: f64,
+    reserved_last_t: i64,
 }
 
 struct Core {
@@ -101,6 +131,13 @@ struct Core {
     events: VecDeque<ExecEvent>,
     stats: Stats,
     risk: RiskState,
+    /// Route-capture calibration (learned per venue-pair edge multipliers).
+    calib: calib::Calib,
+    /// Account equity at boot — the compounding baseline.
+    base_equity: f64,
+    /// Set when a fresh engine snapshot landed on the broadcast bus; the
+    /// scan tick consumes it (event-driven burst scanning).
+    snap_fresh: bool,
     next_id: u64,
     watch_set: FxHashSet<String>,
     watch_dirty: bool,
@@ -143,9 +180,14 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
 
     let out = Arc::new(ArcSwap::from_pointee(empty_snapshot(mode)));
 
+    // Cadences (IVARB_EXEC_* overrides) — captured before `deps` moves
+    // into the core.
+    let (deps_scan_ms, deps_monitor_ms, deps_push_ms) = (deps.scan_ms, deps.monitor_ms, deps.push_ms);
+    let opps_light = deps.opps_light.clone();
+
     let mut core = Core {
         broker: Arc::new(PaperBroker::new(&venue_ids, 250_000.0)),
-        settings: ExecSettings::default(),
+        settings: profile_settings(),
         armed: false,
         kill: None,
         mode,
@@ -162,8 +204,22 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
             trades_closed: 0,
             capture_sum: 0.0,
             capture_n: 0.0,
+            gross_locked_usd: 0.0,
+            exit_drift_usd: 0.0,
+            hedge_pnl_usd: 0.0,
+            wins: 0,
+            losses: 0,
+            gross_wins: 0.0,
+            gross_losses: 0.0,
+            capital_reserved_usd: 0.0,
+            capital_peak_usd: 0.0,
+            reserved_time_s: 0.0,
+            reserved_last_t: now_ms(),
         },
         risk: RiskState::new(),
+        calib: calib::Calib::new(),
+        base_equity: 0.0,
+        snap_fresh: false,
         next_id: 1,
         watch_set: FxHashSet::default(),
         watch_dirty: false,
@@ -182,6 +238,23 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
         arming_blockers,
         route_warned: false,
     };
+    // Compounding baseline: equity at boot (per-venue starting balances,
+    // before any trading). Sizing scales with equity / base_equity.
+    core.base_equity = core.broker.equity().max(1.0);
+    core.ev(
+        None,
+        ExecLevel::Info,
+        "control",
+        format!(
+            "risk profile '{}' — min edge {:.2} vp · kelly {:.0}% · max {} open · {} concurrent · daily loss limit {:.0} USD",
+            std::env::var("IVARB_PROFILE").unwrap_or_else(|_| "balanced".into()),
+            core.settings.min_edge_vp,
+            100.0 * core.settings.kelly_fraction,
+            core.settings.max_open_positions,
+            core.settings.max_concurrent_attempts,
+            core.settings.daily_loss_limit_usd,
+        ),
+    );
 
     // ---- boot banner + (optional) live session connect ----
     if arming.fully_armed() {
@@ -226,12 +299,46 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
         );
     }
 
+    // ---- auto-arm (automatic arb taking) --------------------------------
+    // In paper mode the taker arms itself at boot: simulated fills only,
+    // real money never moves, and opportunities are taken the moment they
+    // pass every gate. Live mode NEVER auto-arms — the ARM button there is
+    // an explicit human action, as it should be.
+    let autoarm = !matches!(
+        std::env::var("IVARB_AUTOARM").as_deref(),
+        Ok("0") | Ok("off") | Ok("false") | Ok("no")
+    );
+    if autoarm && matches!(mode, ExecMode::Paper) {
+        core.armed = true;
+        core.ev(
+            None,
+            ExecLevel::Ok,
+            "control",
+            "AUTO-ARMED at boot (paper mode) — the advantage taker is taking every opportunity that passes the risk gates (IVARB_AUTOARM=0 disables)".into(),
+        );
+    }
+
+    let (deps_scan_ms, deps_monitor_ms, deps_push_ms) = (deps_scan_ms, deps_monitor_ms, deps_push_ms);
+    let opps_light = opps_light;
     tokio::spawn(async move {
-        let mut scan = tokio::time::interval(Duration::from_millis(250));
-        let mut monitor = tokio::time::interval(Duration::from_secs(1));
-        let mut push = tokio::time::interval(Duration::from_millis(750));
+        // Event-driven burst scanning: a fast tick that fires a scan the
+        // moment fresh engine news lands on the broadcast bus (snapshots or
+        // batched opp deltas), plus a 300 ms heartbeat fallback so quiet
+        // feeds never stall the taker. Candidates come from the engine's
+        // `opps_light` cache when it has data (fresher than the snapshot).
+        let mut bcast_rx = core.deps.bcast.subscribe();
+        let mut scan = tokio::time::interval(Duration::from_millis(
+            deps_scan_ms.clamp(10, 1_000),
+        ));
+        let mut monitor = tokio::time::interval(Duration::from_millis(
+            deps_monitor_ms.clamp(100, 10_000),
+        ));
+        let mut push = tokio::time::interval(Duration::from_millis(
+            deps_push_ms.clamp(100, 5_000),
+        ));
         scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_scan = tokio::time::Instant::now() - Duration::from_secs(1);
         loop {
             tokio::select! {
                 cmd = core.cmd_rx.recv() => {
@@ -258,7 +365,28 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
                         core.handle_live_msg(m);
                     }
                 }
-                _ = scan.tick() => core.scan(),
+                b = bcast_rx.recv() => {
+                    match b {
+                        Ok(txt) => {
+                            // Engine news only — full snapshots and batched
+                            // opp deltas both mark data fresh; our own exec
+                            // publishes and the GA pump are ignored.
+                            if txt.starts_with(SNAP_PREFIX) || txt.starts_with(OPPS_PREFIX) {
+                                core.snap_fresh = true;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {}
+                    }
+                }
+                _ = scan.tick() => {
+                    let t = tokio::time::Instant::now();
+                    if core.snap_fresh || t.duration_since(last_scan) >= Duration::from_millis(300) {
+                        core.snap_fresh = false;
+                        last_scan = t;
+                        core.scan_with(&opps_light);
+                    }
+                }
                 _ = monitor.tick() => core.monitor(),
                 _ = push.tick() => {
                     if core.dirty {
@@ -296,6 +424,18 @@ fn empty_snapshot(mode: ExecMode) -> ExecSnapshot {
             single_leg_events: 0,
             capture_ratio: 0.0,
             trades_closed: 0,
+            equity_usd: 0.0,
+            net_deposits_usd: 0.0,
+            capital_reserved_usd: 0.0,
+            capital_free_usd: 0.0,
+            roc_session_pct: 0.0,
+            gross_locked_usd: 0.0,
+            exit_drift_usd: 0.0,
+            hedge_pnl_usd: 0.0,
+            wins: 0,
+            losses: 0,
+            profit_factor: 0.0,
+            avg_trade_usd: 0.0,
         },
         settings: ExecSettings::default(),
         regime: TimeRegime {
@@ -309,8 +449,52 @@ fn empty_snapshot(mode: ExecMode) -> ExecSnapshot {
         trades: Vec::new(),
         events: Vec::new(),
         balances: Vec::new(),
+        deposits_by_venue: Vec::new(),
         live: LiveStatus::default(),
+        routes: Vec::new(),
     }
+}
+
+/// IVARB_PROFILE risk presets — the operating point between "never lose a
+/// night's sleep" and "press every displayed edge". Profiles only shape the
+/// taker's `ExecSettings` at boot; every gate, the kill switch and the live
+/// triple-gate remain in force regardless of profile.
+///
+/// - `conservative` — wide gates, quarter-Kelly, one attempt at a time.
+/// - `balanced`     — the tuned default (what the paper marathon ran).
+/// - `aggressive`   — thinner gates, more concurrency, larger vega budget.
+/// - `sniper`       — IOC-only: no passive convergence legs, wide gate,
+///   higher Kelly on the few decisive dislocations.
+fn profile_settings() -> ExecSettings {
+    let mut s = ExecSettings::default();
+    match std::env::var("IVARB_PROFILE").as_deref() {
+        Ok("conservative") => {
+            s.min_edge_vp = 1.0;
+            s.kelly_fraction = 0.15;
+            s.max_concurrent_attempts = 1;
+            s.max_open_positions = 3;
+            s.max_total_vega_usd = 2_000.0;
+            s.daily_loss_limit_usd = 800.0;
+            s.max_participation = 0.25;
+        }
+        Ok("aggressive") => {
+            s.min_edge_vp = 0.35;
+            s.kelly_fraction = 0.40;
+            s.max_concurrent_attempts = 4;
+            s.max_open_positions = 10;
+            s.max_total_vega_usd = 8_000.0;
+            s.daily_loss_limit_usd = 4_000.0;
+            s.max_participation = 0.50;
+        }
+        Ok("sniper") => {
+            s.min_edge_vp = 0.8;
+            s.kelly_fraction = 0.30;
+            s.convergence_enabled = false;
+            s.max_participation = 0.45;
+        }
+        _ => {}
+    }
+    s
 }
 
 impl Core {
@@ -366,6 +550,38 @@ impl Core {
                     p.closing = true;
                 }
                 self.ev(None, ExecLevel::Error, "control", "FLATTEN ALL — closing every open position at market".into());
+            }
+            ExecCommand::Deposit { venue, amount_usd } => {
+                if self.broker.deposit(&venue, amount_usd) {
+                    self.ev(
+                        None,
+                        ExecLevel::Ok,
+                        "treasury",
+                        format!("DEPOSIT {:.0} USD → {} — new balance {:.0} USD", amount_usd, venue, self.broker.balance_of(&venue)),
+                    );
+                } else {
+                    self.ev(None, ExecLevel::Error, "treasury", format!("deposit rejected (amount must be positive): {amount_usd} USD"));
+                }
+            }
+            ExecCommand::Withdraw { venue, amount_usd } => {
+                if self.broker.withdraw(&venue, amount_usd) {
+                    self.ev(
+                        None,
+                        ExecLevel::Warn,
+                        "treasury",
+                        format!("WITHDRAW {:.0} USD ← {} — remaining {:.0} USD", amount_usd, venue, self.broker.balance_of(&venue)),
+                    );
+                } else {
+                    self.ev(
+                        None,
+                        ExecLevel::Error,
+                        "treasury",
+                        format!(
+                            "withdrawal rejected (insufficient balance or bad amount): {:.0} USD from {} (has {:.0})",
+                            amount_usd, venue, self.broker.balance_of(&venue)
+                        ),
+                    );
+                }
             }
             ExecCommand::LivePreflight => {
                 self.ev(None, ExecLevel::Info, "live", "preflight: checking arming gates, Deribit credentials and account…".into());
@@ -580,7 +796,7 @@ impl Core {
     // ------------------------------------------------------------------
     // scanner
     // ------------------------------------------------------------------
-    fn scan(&mut self) {
+    fn scan_with(&mut self, opps_light: &Arc<ArcSwap<Vec<Opportunity>>>) {
         if !self.armed || self.kill.is_some() {
             return;
         }
@@ -601,34 +817,118 @@ impl Core {
         }
         let snap = self.deps.snapshot.load();
         let now = now_ms();
+        // Candidates: the engine's ms-fresh light cache when populated
+        // (written every analytics pass, ~250 ms), else the full snapshot's
+        // list (1 s cadence). Both carry the same Opportunity shape.
+        let light = opps_light.load();
+        let opps: &[Opportunity] = if light.is_empty() {
+            &snap.opportunities
+        } else {
+            &light
+        };
         let mut unrealized = 0.0;
         for p in self.positions.values() {
             unrealized += p.mtm.unrealized_usd;
         }
-        // Rank candidates by EV, dedup by instrument (best pair per contract).
-        let mut best: FxHashMap<String, &Opportunity> = FxHashMap::default();
-        for o in snap.opportunities.iter() {
+        let balances: FxHashMap<String, f64> = self.broker.balances().into_iter().collect();
+        // Venue spec index (fees, contract sizes) — built once per scan and
+        // shared by the ranking and the risk gate so both see identical math.
+        let venues: FxHashMap<&str, &ivarb_protocol::VenueStatus> =
+            snap.venues.iter().map(|v| (v.venue.as_str(), v)).collect();
+        // Equity compounding: sizes scale with account growth since boot
+        // (clamped — the capital gate remains the final authority on what
+        // balances can actually fund).
+        let equity_scale = (self.broker.equity() / self.base_equity).clamp(0.25, 3.0);
+        // Per-scan capital budget: at most 60% of free capital may be
+        // committed in one sweep, ranked-best first — dry powder for the next
+        // dislocation instead of a full book on one tick.
+        let mut capital_budget = 0.60 * (self.broker.equity() - self.stats.capital_reserved_usd).max(0.0);
+
+        // Portfolio concentration: open positions + live attempts per
+        // underlying. Cross-venue arbs on the same underlying are strongly
+        // correlated — one vol shock moves them all at once.
+        let mut per_underlying: FxHashMap<&str, u32> = FxHashMap::default();
+        for p in self.positions.values() {
+            *per_underlying.entry(p.underlying.as_str()).or_insert(0) += 1;
+        }
+        for (_, (o, _)) in self.live_attempts.iter() {
+            *per_underlying.entry(o.underlying.as_str()).or_insert(0) += 1;
+        }
+
+        // Rank candidates by CAPITAL EFFICIENCY — expected USD profit per
+        // USD of capital the trade reserves (ev_vp × vega per unit ÷ capital
+        // per unit; the unit count cancels). Raw EV ranking starves the
+        // portfolio's best ROIs whenever a fat-vega, margin-heavy trade sits
+        // on top of the list; this score is what a capital-constrained book
+        // actually wants to fire first. Dedup by instrument (best pair per
+        // contract).
+        let mut best: FxHashMap<String, (f64, &Opportunity)> = FxHashMap::default();
+        for o in opps.iter() {
             if o.stale || o.retired {
                 continue;
             }
             if !matches!(o.tier, ivarb_protocol::Tier::Sniper | ivarb_protocol::Tier::Convergence) {
                 continue;
             }
+            // Adverse-drift hard skip: both legs running away from convergence
+            // (rich leg richer, cheap leg cheaper) — the edge is decaying
+            // faster than two IOC legs can capture it.
+            if o.drift_sell_vp_1m > 0.20 && o.drift_buy_vp_1m < -0.20 {
+                continue;
+            }
+            // Concentration cap per underlying.
+            if per_underlying.get(o.underlying.as_str()).copied().unwrap_or(0)
+                >= self.settings.max_per_underlying
+            {
+                continue;
+            }
+            let Ok((buy_need, sell_need)) = risk::capital_needs(o, &venues) else {
+                continue;
+            };
+            // Route calibration: what this venue pair actually banks of its
+            // displayed edge (learned from closed trades + abort rates).
+            // Flicker pairs (abort-dominated books) are skipped outright.
+            let route = format!("{}>{}", o.buy_venue, o.sell_venue);
+            if self.calib.flicker(&route) {
+                continue;
+            }
+            let route_mult = self.calib.edge_mult(&route);
+            let vega_unit = if o.contract_size > 0.0 {
+                o.vega_vp_usd / o.contract_size
+            } else {
+                o.vega_vp_usd
+            };
+            let cap_unit = buy_need + sell_need;
+            let score = if vega_unit > 1e-9 && cap_unit > 1e-9 {
+                o.ev_vp * route_mult * vega_unit / cap_unit
+            } else {
+                0.0
+            };
             let inst = canonical_inst(o);
-            let better = best.get(&inst).map(|cur| o.ev_vp > cur.ev_vp).unwrap_or(true);
+            let better = best.get(&inst).map(|(s, _)| score > *s).unwrap_or(true);
             if better {
-                best.insert(inst, o);
+                best.insert(inst, (score, o));
             }
         }
-        let mut cands: Vec<&Opportunity> = best.into_values().collect();
-        cands.sort_by(|a, b| b.ev_vp.partial_cmp(&a.ev_vp).unwrap_or(std::cmp::Ordering::Equal));
+        let mut cands: Vec<(f64, &Opportunity)> = best.into_values().collect();
+        cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        for o in cands {
+        for (_, o) in cands {
             if self.live_attempts.len() as u32 >= self.settings.max_concurrent_attempts {
                 break;
             }
-            if o.ev_vp <= 0.05 {
+            // Calibrated firing floor: the route's learned capture must
+            // clear the bar, not the scanner's optimistic print.
+            let route = format!("{}>{}", o.buy_venue, o.sell_venue);
+            let route_mult = self.calib.edge_mult(&route);
+            if o.ev_vp * route_mult <= 0.05 {
                 continue;
+            }
+            // Capital budget for this sweep — ranked-best first.
+            if let Ok((buy_need, sell_need)) = risk::capital_needs(o, &venues) {
+                if (buy_need + sell_need) * 0.10 > capital_budget {
+                    continue; // even a minimum clip starves the budget
+                }
             }
             if let Ok(units) = self.risk.preflight(
                 o,
@@ -638,8 +938,13 @@ impl Core {
                 &self.kill,
                 self.stats.realized_usd,
                 unrealized,
+                &balances,
+                equity_scale,
                 now,
             ) {
+                if let Ok((buy_need, sell_need)) = risk::capital_needs(o, &venues) {
+                    capital_budget -= (buy_need + sell_need) * units;
+                }
                 self.spawn_attempt(o.clone(), units);
             }
         }
@@ -656,15 +961,21 @@ impl Core {
         for p in self.positions.values() {
             unrealized += p.mtm.unrealized_usd;
         }
+        let balances: FxHashMap<String, f64> = self.broker.balances().into_iter().collect();
         // Manual takes bypass the armed flag but respect every risk gate —
         // and the live route-completeness rule.
         if let Err(reason) = self.live_route_ok(&o) {
             self.ev(Some(o.id.clone()), ExecLevel::Error, "manual", format!("manual TAKE refused: {reason}"));
             return;
         }
-        match self.risk.preflight(&o, &snap, &self.settings, true, &self.kill, self.stats.realized_usd, unrealized, now) {
+        match self.risk.preflight(&o, &snap, &self.settings, true, &self.kill, self.stats.realized_usd, unrealized, &balances, 1.0, now) {
             Ok(auto_units) => {
                 let units = units.unwrap_or(auto_units).min(auto_units).max(0.01);
+                let route = format!("{}>{}", o.buy_venue, o.sell_venue);
+                let mult = self.calib.edge_mult(&route);
+                if mult < 0.85 {
+                    self.ev(Some(o.id.clone()), ExecLevel::Warn, "calib", format!("route {route} fires at {:.0}% of displayed edge (learned capture) — sizing unchanged, watch this pair", 100.0 * mult));
+                }
                 self.ev(Some(o.id.clone()), ExecLevel::Warn, "manual", format!("manual TAKE — spawning attempt with {units:.2} units"));
                 self.spawn_attempt(o, units);
             }
@@ -679,6 +990,13 @@ impl Core {
         self.next_id += 1;
         self.stats.attempts_total += 1;
         self.risk.reserve(&opp, units);
+        // Calibration hook: this route gets another sample.
+        let route = format!("{}>{}", opp.buy_venue, opp.sell_venue);
+        self.calib.record_attempt(&route);
+        let route_mult = self.calib.edge_mult(&route);
+        if route_mult < 0.85 && route_mult > 0.0 {
+            self.ev(Some(opp.id.clone()), ExecLevel::Warn, "calib", format!("route {route}: firing at {:.0}% of displayed edge (learned capture)", 100.0 * route_mult));
+        }
         self.live_attempts.insert(attempt, (opp.clone(), units));
 
         // Watch this instrument for the lifetime of the attempt — registered
@@ -735,6 +1053,7 @@ impl Core {
             }
             AttemptOutcome::Aborted { reason, cooldown_ms } => {
                 self.risk.release(&opp, units, cooldown_ms, now_ms());
+                self.calib.record_abort(&format!("{}>{}", opp.buy_venue, opp.sell_venue));
                 let inst = canonical_inst(&opp);
                 if !self.positions.values().any(|p| canonical_inst_of_pos(p) == inst) {
                     self.watch_set.remove(&inst);
@@ -771,7 +1090,7 @@ impl Core {
         let ct_buy = if opp.contract_size > 0.0 { opp.contract_size } else { 1.0 };
         let ct_sell = if d.contracts_sell > 0.0 { d.units / d.contracts_sell } else { 1.0 };
         let vega_unit = (opp.vega_vp_usd / ct_buy).max(1e-9);
-        let pos = Position {
+        let mut pos = Position {
             id,
             attempt,
             opp: opp.id.clone(),
@@ -812,16 +1131,59 @@ impl Core {
             // betting on), not the touch-locked entry: passive fills at
             // favorable limits always beat the signal, and exiting the
             // instant mids < entry would churn the position for nothing.
-            // We take profit when the mid spread converges to ~25% of the
-            // signal, stop when it inverts past it, and cap theta burn.
-            exit_take_vp: (self.settings.take_profit_frac * opp.net_vp.max(0.0)).max(0.05),
+            // The take target is FEE-AWARE: exiting costs both legs' taker
+            // fees again, so on thin edges we wait for deeper convergence
+            // (net − entry-fee − 10bp margin) instead of taking a "profit"
+            // the round-trip fees would eat. The trailing lock in the
+            // monitor then banks the capture early if it bounces.
+            exit_take_vp: {
+                let net = opp.net_vp.max(0.0);
+                let fee_vp = d.entry_fees_usd / (d.units * vega_unit).max(1e-9);
+                (self.settings.take_profit_frac * net)
+                    .min((net - fee_vp - 0.10).max(0.05))
+                    .max(0.05)
+            },
             exit_stop_vp: -(self.settings.stop_mult * opp.net_vp.max(0.0)).max(0.10),
             theta_budget_vp: (self.settings.theta_budget_frac * opp.net_vp.max(0.0)).max(0.10),
             max_hold_s: opp.hold_s.max(60.0),
+            min_spread_vp: d.entry_spread_vp,
+            peak_unrealized_usd: 0.0,
             hedge_units: 0.0,
             hedge_avg_px: 0.0,
+            capital_usd: 0.0,
             closing: false,
         };
+        // Capital reserved by this position: long premium + entry fees on the
+        // buy venue, buffered short-option margin + fees on the sell venue.
+        let snap = self.deps.snapshot.load();
+        let sell_fee_rate = snap
+            .venues
+            .iter()
+            .find(|v| v.venue == opp.sell_venue)
+            .map(|v| v.taker_fee_rate)
+            .filter(|r| *r > 0.0)
+            .unwrap_or(0.0003);
+        let margin_ct = ivarb_quant::margin_per_contract(
+            &opp.sell_venue,
+            d.sell_px_unit,
+            ct_sell,
+            opp.spot,
+            opp.strike,
+            match opp.right {
+                ivarb_protocol::Right::Call => ivarb_quant::QuantRight::Call,
+                ivarb_protocol::Right::Put => ivarb_quant::QuantRight::Put,
+            },
+        );
+        let capital = d.buy_px_unit * d.units
+            + margin_ct * d.contracts_sell * (1.0 + ivarb_quant::MARGIN_BUFFER)
+            + d.entry_fees_usd
+            + sell_fee_rate * opp.spot * d.units;
+        pos.capital_usd = capital;
+        self.stats.capital_reserved_usd += capital;
+        self.stats.capital_peak_usd = self.stats.capital_peak_usd.max(self.stats.capital_reserved_usd);
+        let now_ms_val = now;
+        self.stats.reserved_time_s += (now_ms_val - self.stats.reserved_last_t).max(0) as f64 / 1000.0;
+        self.stats.reserved_last_t = now_ms_val;
         self.positions.insert(id, pos);
         self.risk.promote();
         self.stats.fills_total += 2;
@@ -872,6 +1234,17 @@ impl Core {
                         + (p.entry.sell_px_usd - sell_mid) * p.units
                         - p.entry.fees_usd
                         + p.mtm.hedge_pnl_usd;
+                    // Trailing anchor: the best (lowest) mid spread seen —
+                    // only ever decreases, and only on fresh quotes so a
+                    // stale tick can never fake a new best.
+                    if p.mtm.spread_vp < p.min_spread_vp {
+                        p.min_spread_vp = p.mtm.spread_vp;
+                    }
+                    // USD profit ratchet anchor: the best unrealized P&L
+                    // seen — only ever increases, fresh quotes only.
+                    if p.mtm.unrealized_usd > p.peak_unrealized_usd {
+                        p.peak_unrealized_usd = p.mtm.unrealized_usd;
+                    }
                 }
                 // Theta burn (BS at the current mid IV).
                 let iv_mid = match (bl.iv_mark_vp, sl.iv_mark_vp) {
@@ -917,6 +1290,25 @@ impl Core {
                     to_close.push((*id, ExitReason::Manual));
                 } else if p.mtm.spread_vp <= p.exit_take_vp {
                     to_close.push((*id, ExitReason::TakeProfit));
+                } else if {
+                    // Trailing lock: once ≥50% of the signal edge has
+                    // converged, bank it — if the spread gives back more than
+                    // 30% of the achieved progress, exit on the bounce
+                    // instead of riding it back to the stop.
+                    let net = p.entry.signal_net_vp.max(0.0);
+                    let progress = net - p.min_spread_vp;
+                    progress >= 0.5 * net
+                        && p.mtm.spread_vp >= p.min_spread_vp + 0.30 * progress
+                } {
+                    to_close.push((*id, ExitReason::Trail));
+                } else if p.peak_unrealized_usd >= 25.0
+                    && p.mtm.unrealized_usd <= 0.55 * p.peak_unrealized_usd
+                {
+                    // USD profit ratchet: a materially profitable position
+                    // that has given back 45% of its peak banks the remainder
+                    // now — theta and exit drift round-trip paper profits
+                    // faster than the spread trail can see them.
+                    to_close.push((*id, ExitReason::Trail));
                 } else if p.mtm.spread_vp <= p.exit_stop_vp {
                     to_close.push((*id, ExitReason::Stop));
                 } else if theta_burn_vp >= p.theta_budget_vp {
@@ -1009,6 +1401,12 @@ impl Core {
         let sane = |px: f64, ref_px: f64| -> bool {
             px > 0.0 && ref_px > 0.0 && (0.6..=1.6).contains(&(px / ref_px))
         };
+        tracing::info!(
+            "exit quotes pos={} inst={} units={} entry_buy={:.2} entry_sell={:.2} buy_bid={:?} buy_mark={:?} sell_ask={:?} sell_mark={:?}",
+            p.id, inst, p.units, p.entry.buy_px_usd, p.entry.sell_px_usd,
+            buy_leg.and_then(|l| l.px_bid_unit), buy_leg.and_then(|l| l.px_mark_unit),
+            sell_leg.and_then(|l| l.px_ask_unit), sell_leg.and_then(|l| l.px_mark_unit),
+        );
         let (sell_px, mut exit_fees) = match buy_leg
             .and_then(|l| l.px_bid_unit)
             .filter(|x| sane(*x, p.entry.buy_px_usd))
@@ -1022,13 +1420,25 @@ impl Core {
                 );
                 (f.px_unit, f.fee_usd)
             }
-            _ => (
-                buy_leg
+            _ => {
+                // Degrade: exit at the venue MARK when the book is dust — but
+                // the mark must itself be sane vs the entry premium. Venue
+                // marks come in mixed scales (coin-margined, forward-based,
+                // per-contract vs per-unit); an insane mark here once booked a
+                // phantom $162k loss on a $6.4k position. Entry price is the
+                // final fallback: flat, honest, bounded.
+                let mark = buy_leg
                     .and_then(|l| l.px_mark_unit)
-                    .filter(|x| *x > 0.0)
-                    .unwrap_or(p.entry.buy_px_usd),
-                0.0,
-            ), // degrade: exit at mark (or entry) when the book is dust
+                    .filter(|x| sane(*x, p.entry.buy_px_usd));
+                if buy_leg.and_then(|l| l.px_bid_unit).is_some() || buy_leg.and_then(|l| l.px_mark_unit).is_some() {
+                    tracing::warn!(
+                        "exit degraded to {} on {} — book dust or insane mark (bid={:?} mark={:?} entry={:.2})",
+                        if mark.is_some() { "mark" } else { "entry" }, p.buy_venue,
+                        buy_leg.and_then(|l| l.px_bid_unit), buy_leg.and_then(|l| l.px_mark_unit), p.entry.buy_px_usd,
+                    );
+                }
+                (mark.map(|m| m).unwrap_or(p.entry.buy_px_usd), 0.0)
+            }
         };
         // Buy back the short leg at its venue's ask.
         let (buyback_px, fee2) = match sell_leg
@@ -1044,13 +1454,19 @@ impl Core {
                 );
                 (f.px_unit, f.fee_usd)
             }
-            _ => (
-                sell_leg
+            _ => {
+                let mark = sell_leg
                     .and_then(|l| l.px_mark_unit)
-                    .filter(|x| *x > 0.0)
-                    .unwrap_or(p.entry.sell_px_usd),
-                0.0,
-            ),
+                    .filter(|x| sane(*x, p.entry.sell_px_usd));
+                if sell_leg.and_then(|l| l.px_ask_unit).is_some() || sell_leg.and_then(|l| l.px_mark_unit).is_some() {
+                    tracing::warn!(
+                        "exit degraded to {} on {} — book dust or insane mark (ask={:?} mark={:?} entry={:.2})",
+                        if mark.is_some() { "mark" } else { "entry" }, p.sell_venue,
+                        sell_leg.and_then(|l| l.px_ask_unit), sell_leg.and_then(|l| l.px_mark_unit), p.entry.sell_px_usd,
+                    );
+                }
+                (mark.map(|m| m).unwrap_or(p.entry.sell_px_usd), 0.0)
+            }
         };
         exit_fees += fee2;
 
@@ -1063,17 +1479,54 @@ impl Core {
             p.hedge_units = 0.0;
         }
 
-        let legs_pnl = (sell_px - p.entry.buy_px_usd) * p.units
+        // Hard clamp: a hedged option spread on `units` underlying cannot
+        // gain or lose more than a multiple of the notional — anything
+        // beyond that is a data artifact, never a market move. Belt and
+        // suspenders on top of the sane-banded exit prices above.
+        let legs_pnl_raw = (sell_px - p.entry.buy_px_usd) * p.units
             + (p.entry.sell_px_usd - buyback_px) * p.units;
+        let pnl_bound = 2.0 * spot * p.units + (p.entry.buy_px_usd + p.entry.sell_px_usd) * p.units;
+        let legs_pnl = if legs_pnl_raw.abs() > pnl_bound {
+            tracing::error!(
+                "phantom exit P&L clamped: raw {:.2} → bound ±{:.2} (sell_px={:.2} buyback={:.2} entry {:.2}/{:.2} units={:.4}) — venue quote scale artifact",
+                legs_pnl_raw, pnl_bound, sell_px, buyback_px, p.entry.buy_px_usd, p.entry.sell_px_usd, p.units
+            );
+            legs_pnl_raw.clamp(-pnl_bound, pnl_bound)
+        } else {
+            legs_pnl_raw
+        };
         let realized = legs_pnl - p.entry.fees_usd - exit_fees + p.mtm.hedge_pnl_usd + hedge_exit_pnl;
         let realized_vp = realized / (p.units * vega_unit).max(1e-9);
         let hold_s = (now - p.entry.t_ms) as f64 / 1000.0;
 
+        // Profit attribution: what was locked at entry vs what the market
+        // gave/took between entry and exit vs explicit costs.
+        let total_fees = p.entry.fees_usd + exit_fees;
+        let hedge_total = p.mtm.hedge_pnl_usd + hedge_exit_pnl;
+        let gross_locked = (p.entry.sell_px_usd - p.entry.buy_px_usd) * p.units;
+        let exit_drift = realized - gross_locked + total_fees - hedge_total;
+
         self.stats.realized_usd += realized;
-        self.stats.fees_usd += p.entry.fees_usd + exit_fees;
+        self.stats.fees_usd += total_fees;
         self.stats.trades_closed += 1;
+        self.stats.gross_locked_usd += gross_locked;
+        self.stats.exit_drift_usd += exit_drift;
+        self.stats.hedge_pnl_usd += hedge_total;
+        if realized >= 0.0 {
+            self.stats.wins += 1;
+            self.stats.gross_wins += realized;
+        } else {
+            self.stats.losses += 1;
+            self.stats.gross_losses += -realized;
+        }
+        self.stats.capital_reserved_usd = (self.stats.capital_reserved_usd - p.capital_usd).max(0.0);
+        self.stats.capital_peak_usd = self.stats.capital_peak_usd.max(self.stats.capital_reserved_usd);
         self.stats.capture_sum += (realized_vp / p.entry.signal_net_vp).clamp(-5.0, 5.0);
         self.stats.capture_n += 1.0;
+        self.calib.record_close(
+            &format!("{}>{}", p.buy_venue, p.sell_venue),
+            realized_vp / p.entry.signal_net_vp.max(1e-9),
+        );
         self.risk.position_closed(&inst, p.units, vega_unit);
         self.watch_set.remove(&inst);
         self.watch_dirty = true;
@@ -1092,8 +1545,11 @@ impl Core {
             realized_vp,
             realized_usd: realized,
             slippage_vp: realized_vp - p.entry.signal_net_vp,
-            fees_usd: p.entry.fees_usd + exit_fees,
-            hedge_pnl_usd: p.mtm.hedge_pnl_usd + hedge_exit_pnl,
+            fees_usd: total_fees,
+            gross_locked_usd: gross_locked,
+            exit_drift_usd: exit_drift,
+            capital_usd: p.capital_usd,
+            hedge_pnl_usd: hedge_total,
             hold_s,
             exit_reason: reason,
             opened_ms: p.entry.t_ms,
@@ -1105,6 +1561,7 @@ impl Core {
         }
         let reason_s = match reason {
             ExitReason::TakeProfit => "spread converged",
+            ExitReason::Trail => "trailing lock — profit banked on the bounce",
             ExitReason::Stop => "stop — spread inverted",
             ExitReason::ThetaBudget => "theta budget exhausted",
             ExitReason::MaxHold => "max hold window",
@@ -1135,6 +1592,21 @@ impl Core {
         for p in self.positions.values() {
             unrealized += p.mtm.unrealized_usd;
         }
+        let equity = self.broker.equity();
+        let net_deposits = self.broker.net_deposits();
+        let session_pnl = self.stats.realized_usd + unrealized;
+        let roc_session = if self.stats.capital_peak_usd > 1.0 {
+            100.0 * session_pnl / self.stats.capital_peak_usd
+        } else {
+            0.0
+        };
+        let profit_factor = if self.stats.gross_losses > 1e-9 {
+            self.stats.gross_wins / self.stats.gross_losses
+        } else if self.stats.gross_wins > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
         let snapshot = ExecSnapshot {
             t_ms: now,
             stats: ExecStats {
@@ -1157,6 +1629,22 @@ impl Core {
                     0.0
                 },
                 trades_closed: self.stats.trades_closed,
+                equity_usd: equity,
+                net_deposits_usd: net_deposits,
+                capital_reserved_usd: self.stats.capital_reserved_usd,
+                capital_free_usd: (equity - self.stats.capital_reserved_usd).max(0.0),
+                roc_session_pct: roc_session,
+                gross_locked_usd: self.stats.gross_locked_usd,
+                exit_drift_usd: self.stats.exit_drift_usd,
+                hedge_pnl_usd: self.stats.hedge_pnl_usd,
+                wins: self.stats.wins,
+                losses: self.stats.losses,
+                profit_factor,
+                avg_trade_usd: if self.stats.trades_closed > 0 {
+                    self.stats.realized_usd / self.stats.trades_closed as f64
+                } else {
+                    0.0
+                },
             },
             settings: self.settings.clone(),
             regime: TimeRegime {
@@ -1170,7 +1658,9 @@ impl Core {
             trades: self.trades.iter().cloned().collect(),
             events: self.events.iter().cloned().collect(),
             balances: self.broker.balances(),
+            deposits_by_venue: self.broker.deposits_by_venue(),
             live: self.live_status_now(),
+            routes: self.calib.snapshot(),
         };
         if let Ok(txt) = serde_json::to_string(&ivarb_protocol::ServerMsg::Exec { exec: snapshot.clone() }) {
             let _ = self.deps.bcast.send(Arc::new(txt));

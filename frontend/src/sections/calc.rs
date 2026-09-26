@@ -93,7 +93,7 @@ pub fn MathSection() -> impl IntoView {
 
     view! {
         <section class="section" id="math">
-            <SectionHead num="06" title="The math: live calculator"
+            <SectionHead num="07" title="The math: live calculator"
                 sub="Sanity-check any signal before trading. The key question is always: does the IV spread cover both legs of taker fees?"/>
             <div class="calc-panel">
                 <div class="calc-inputs">

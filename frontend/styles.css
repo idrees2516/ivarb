@@ -1171,6 +1171,82 @@ code {
   .taker-grid { grid-template-columns: 1fr; }
 }
 
+/* ---------------- funding, costs & capital (section 03) ---------------- */
+.fund-treasury {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px; margin: 12px 0 8px;
+}
+.ft-cell {
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 12px;
+}
+.ft-k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-faint); }
+.ft-v { font-family: var(--mono); font-size: 15px; margin-top: 4px; }
+.ft-cell.pos .ft-v { color: var(--green); }
+.ft-cell.neg .ft-v { color: var(--red); }
+.fund-note { font-size: 12px; color: var(--text-faint); margin-bottom: 12px; line-height: 1.5; }
+.fund-grid { display: grid; grid-template-columns: 1fr 1.2fr; gap: 10px; align-items: start; }
+@media (max-width: 1080px) { .fund-grid { grid-template-columns: 1fr; } }
+
+.fund-form .ff-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+.fund-form .calc-field.grow { flex: 1; min-width: 140px; }
+.ff-actions { display: flex; gap: 8px; }
+.ff-quick { display: flex; gap: 6px; margin-top: 10px; align-items: center; flex-wrap: wrap; }
+.fq-label { font-size: 11px; color: var(--text-faint); }
+.fq-btn {
+  font-family: var(--mono); font-size: 12px; padding: 4px 10px; cursor: pointer;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border-2);
+  border-radius: var(--radius-sm);
+}
+.fq-btn:hover { border-color: var(--green); color: var(--green); }
+
+.fc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
+.fc-card {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 9px 11px; min-width: 0;
+}
+.fc-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.fc-venue { font-size: 12px; font-weight: 650; text-transform: capitalize; }
+.fc-bal { font-family: var(--mono); font-size: 13px; color: var(--green); }
+.fc-dep { font-size: 10.5px; color: var(--text-faint); margin: 3px 0 7px; }
+.fc-rail { display: grid; gap: 3px; }
+.fc-rail > div { display: flex; justify-content: space-between; gap: 8px; }
+.fc-rail .fact-v { font-size: 11px; text-align: right; }
+.fc-note { font-size: 10.5px; color: var(--text-faint); margin-top: 7px; line-height: 1.4; }
+
+.cap-table td.r, .cap-table th.r { text-align: right; }
+.ct-opp { display: flex; flex-direction: column; gap: 2px; min-width: 150px; }
+.ct-pair { font-size: 12px; font-weight: 650; }
+.ct-inst { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+.ct-split { font-size: 11px; color: var(--text-dim); }
+.cap-legend { font-size: 11px; color: var(--text-faint); margin-top: 8px; line-height: 1.45; }
+
+.pp-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 12px; }
+@media (max-width: 720px) { .pp-grid { grid-template-columns: 1fr; } }
+.pp-rows { display: flex; flex-direction: column; gap: 4px; }
+.pp-row {
+  display: flex; justify-content: space-between; gap: 10px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 7px 10px; font-size: 12.5px;
+}
+.pp-k { color: var(--text-dim); }
+.pp-v { font-family: var(--mono); }
+.pp-row.pos .pp-v { color: var(--green); }
+.pp-row.neg .pp-v { color: var(--red); }
+.pp-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; align-content: start; }
+.pp-stat {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 7px 10px;
+}
+.profit-empty { font-size: 12.5px; color: var(--text-faint); padding: 14px 4px; line-height: 1.5; }
+
+.cost-block { margin-top: 10px; }
+.cb-empty { font-size: 12px; color: var(--text-faint); padding: 6px 2px; }
+.cb-funded { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+.cb-hint { font-size: 11px; color: var(--text-faint); }
+.fact-v.pos { color: var(--green); }
+.fact-v.neg { color: var(--red); }
+
 /* ============ 03 Hold-to-expiry lab ============ */
 
 .hold-intro { margin: 14px 0 18px; }
@@ -1267,3 +1343,10 @@ code {
 @media (max-width: 900px) {
   .hold-cols, .ga-cols { grid-template-columns: 1fr; }
 }
+
+/* ---- route calibration panel (taker) ---- */
+.rc-pos { color: var(--green); font-weight: 600; }
+.rc-mid { color: var(--amber); font-weight: 600; }
+.rc-neg { color: var(--red); font-weight: 600; }
+.tk-table tr.cold td { opacity: 0.55; }
+.rc-flick { font-size: 10px; padding: 1px 6px; margin-left: 6px; letter-spacing: 0.04em; }

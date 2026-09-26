@@ -27,7 +27,7 @@ pub fn MultihopSection() -> impl IntoView {
 
     view! {
         <section class="section" id="multihop">
-            <crate::app::SectionHead num="04"
+            <crate::app::SectionHead num="05"
                 title="Multi-hop routes — negative-cycle arbitrage across venues and rights"
                 sub="Every hop is executable: buy an option at an ask, sell at a bid, or convert call↔put on the same venue via put-call parity with a perp hedge. A cycle whose cash flow is positive after every fee is free money — the engine searches all touched strike families for them every 250 ms."/>
             <div class="hold-intro">

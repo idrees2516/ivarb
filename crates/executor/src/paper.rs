@@ -49,6 +49,11 @@ pub struct PaperBroker {
     /// Cumulative fees paid (USD), for stats.
     pub fees_total: Mutex<f64>,
     start_balance: f64,
+    /// Treasury: lifetime deposits / withdrawals (USD), global.
+    deposits_total: Mutex<f64>,
+    withdrawals_total: Mutex<f64>,
+    /// Per-venue lifetime net deposits (for the funding panel).
+    deposits_by_venue: Mutex<FxHashMap<String, f64>>,
 }
 
 impl PaperBroker {
@@ -61,6 +66,9 @@ impl PaperBroker {
             balances: Mutex::new(m),
             fees_total: Mutex::new(0.0),
             start_balance,
+            deposits_total: Mutex::new(0.0),
+            withdrawals_total: Mutex::new(0.0),
+            deposits_by_venue: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -71,6 +79,67 @@ impl PaperBroker {
     pub fn balances(&self) -> Vec<(String, f64)> {
         let b = self.balances.lock().unwrap();
         let mut v: Vec<(String, f64)> = b.iter().map(|(k, x)| (k.clone(), *x)).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    /// Balance of one venue (0.0 when unknown).
+    pub fn balance_of(&self, venue: &str) -> f64 {
+        self.balances.lock().unwrap().get(venue).copied().unwrap_or(0.0)
+    }
+
+    /// Total account equity across venues.
+    pub fn equity(&self) -> f64 {
+        self.balances.lock().unwrap().values().sum()
+    }
+
+    /// Lifetime net deposits (deposits − withdrawals), all venues.
+    pub fn net_deposits(&self) -> f64 {
+        *self.deposits_total.lock().unwrap() - *self.withdrawals_total.lock().unwrap()
+    }
+
+    /// Deposit paper money onto a venue. Returns false on non-positive input.
+    pub fn deposit(&self, venue: &str, amount_usd: f64) -> bool {
+        if !amount_usd.is_finite() || amount_usd <= 0.0 {
+            return false;
+        }
+        self.adjust(venue, amount_usd);
+        *self.deposits_total.lock().unwrap() += amount_usd;
+        *self
+            .deposits_by_venue
+            .lock()
+            .unwrap()
+            .entry(venue.to_string())
+            .or_insert(0.0) += amount_usd;
+        true
+    }
+
+    /// Withdraw paper money from a venue (refuses to overdraw).
+    pub fn withdraw(&self, venue: &str, amount_usd: f64) -> bool {
+        if !amount_usd.is_finite() || amount_usd <= 0.0 {
+            return false;
+        }
+        let mut b = self.balances.lock().unwrap();
+        let bal = b.get_mut(venue).copied().unwrap_or(self.start_balance);
+        if bal < amount_usd {
+            return false;
+        }
+        *b.entry(venue.to_string()).or_insert(self.start_balance) -= amount_usd;
+        drop(b);
+        *self.withdrawals_total.lock().unwrap() += amount_usd;
+        *self
+            .deposits_by_venue
+            .lock()
+            .unwrap()
+            .entry(venue.to_string())
+            .or_insert(0.0) -= amount_usd;
+        true
+    }
+
+    /// Per-venue lifetime net deposits, sorted by venue name.
+    pub fn deposits_by_venue(&self) -> Vec<(String, f64)> {
+        let d = self.deposits_by_venue.lock().unwrap();
+        let mut v: Vec<(String, f64)> = d.iter().map(|(k, x)| (k.clone(), *x)).collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v
     }

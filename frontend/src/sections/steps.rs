@@ -42,7 +42,7 @@ pub fn StepsSection() -> impl IntoView {
 
     view! {
         <section class="section" id="execution">
-            <SectionHead num="07" title="Step-by-step execution"
+            <SectionHead num="08" title="Step-by-step execution"
                 sub="Click through each step. The most critical moment is steps 04-05: placing both legs within seconds of each other."/>
             <div class="steps-panel">
                 <div class="steps-rail">

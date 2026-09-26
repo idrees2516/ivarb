@@ -27,7 +27,7 @@ pub fn HoldLabSection() -> impl IntoView {
 
     view! {
         <section class="section" id="holdlab">
-            <crate::app::SectionHead num="03"
+            <crate::app::SectionHead num="04"
                 title="Hold-to-expiry lab — when the arb fails but the option is still cheap"
                 sub="These divergences sit below the 0.5 vp fee-adjusted arb gate: round-tripping both legs loses money. But buying only the cheap leg and holding to expiry can still pay — here is the exact profit and cost of that strategy, computed live."/>
             <div class="hold-intro">

@@ -108,6 +108,20 @@ fn today_ymd() -> u32 {
     (d.year() as u32) * 10_000 + d.month() * 100 + d.day()
 }
 
+/// Days since 1970-01-01 for a yyyymmdd (Howard Hinnant's days_from_civil)
+/// — used to pick the 6-digit reading closest to today.
+fn days_index(ymd: u32) -> i64 {
+    let y = (ymd / 10_000) as i64;
+    let m = ((ymd / 100) % 100) as i64;
+    let d = (ymd % 100) as i64;
+    let (y_adj, m_adj) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let doy = (153 * m_adj + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// 6-digit token parsed as DDMMYY (Delta style) instead of YYMMDD.
 fn parse_date_ddmmyy(t: &str) -> Option<u32> {
     let up = t.trim().to_uppercase();
@@ -122,8 +136,9 @@ fn parse_date_ddmmyy(t: &str) -> Option<u32> {
 
 /// Parse a date token in any of the venue formats:
 /// `DDMMMYY` (24SEP26), `DDMMMYYYY`, `YYMMDD` (260926), `YYYYMMDD` (20260926).
-/// Pure 6-digit tokens that parse to a past date under YYMMDD are retried as
-/// DDMMYY (Delta quotes `250926` for 2026-09-25).
+/// Ambiguous 6-digit tokens (Delta quotes `250926` for 2026-09-25) are
+/// disambiguated by picking the reading **closest to today** — option
+/// expiries are always near-dated, so the reading a year away is wrong.
 pub fn parse_date_token(t: &str) -> Option<u32> {
     let up = t.trim().to_uppercase();
     // Pure-digit forms first so YYMMDD is not swallowed by DDMMMYY.
@@ -132,13 +147,22 @@ pub fn parse_date_token(t: &str) -> Option<u32> {
         let mm: u32 = up[2..4].parse().ok()?;
         let dd: u32 = up[4..6].parse().ok()?;
         let ymd = valid_ymd(2000 + yy, mm, dd);
-        if ymd.map(|d| d < today_ymd()).unwrap_or(false) {
-            // Past date under YYMMDD → Delta-style DDMMYY is more plausible.
-            if let Some(alt) = parse_date_ddmmyy(t) {
-                return Some(alt);
+        let alt = parse_date_ddmmyy(t);
+        return match (ymd, alt) {
+            (Some(a), Some(b)) => {
+                let today = days_index(today_ymd());
+                let da = (days_index(a) - today).abs();
+                let db = (days_index(b) - today).abs();
+                if db < da {
+                    Some(b)
+                } else {
+                    Some(a)
+                }
             }
-        }
-        return ymd;
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
     }
     if up.len() == 8 && up.chars().all(|c| c.is_ascii_digit()) {
         let y: i32 = up[0..4].parse().ok()?;

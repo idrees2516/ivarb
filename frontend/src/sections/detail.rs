@@ -75,6 +75,8 @@ pub fn DetailPanel() -> impl IntoView {
 
                             <ExecPlan o=o.clone()/>
 
+                            <CostCapitalBlock o=o.clone()/>
+
                             <HoldBlock o=o.clone()/>
 
                             <div class="detail-grid">
@@ -179,6 +181,143 @@ fn fmt_secs(s: f64) -> String {
         format!("{:.0}m", s / 60.0)
     } else {
         format!("{:.1}h", s / 3600.0)
+    }
+}
+
+/// The comprehensive cost sheet + capital requirement for this exact
+/// opportunity, per 1 underlying unit, computed in-browser with the same
+/// `ivarb-quant` code the executor's risk gates use.
+#[component]
+fn CostCapitalBlock(o: Opportunity) -> impl IntoView {
+    let st = use_context::<ApiState>().unwrap();
+    let o_id = o.id.clone();
+
+    let analysis = Memo::new(move |_| {
+        let o = st
+            .opps
+            .get()
+            .into_iter()
+            .find(|x| x.id == o_id)
+            .unwrap_or_else(|| o.clone());
+        let (buy_px, sell_px) = match (o.buy_px_usd, o.sell_px_usd) {
+            (Some(b), Some(s)) if b > 0.0 && s > 0.0 => (b, s),
+            _ => return None,
+        };
+        let buy_ct = if o.contract_size > 0.0 { o.contract_size } else { 1.0 };
+        let buy_depth = o.size_buy.map(|u| u / buy_ct).unwrap_or(10.0).max(1.0);
+        let sell_depth = o.size_sell.unwrap_or(10.0).max(1.0);
+        let hold_days = (o.hold_s / 86_400.0).min(o.dte.max(0.1)).max(0.02);
+        let fee = |v: &str| match v {
+            "binance" | "aevo" | "thalex" => 0.0002,
+            _ => 0.0003,
+        };
+        let input = ivarb_quant::CostInput {
+            buy_premium_per_contract: buy_px,
+            sell_premium_per_contract: sell_px,
+            buy_contract_size: buy_ct,
+            sell_contract_size: 1.0,
+            buy_fee_rate: fee(&o.buy_venue),
+            sell_fee_rate: fee(&o.sell_venue),
+            spot: o.spot,
+            strike: o.strike,
+            right: match o.right {
+                ivarb_protocol::Right::Call => ivarb_quant::QuantRight::Call,
+                ivarb_protocol::Right::Put => ivarb_quant::QuantRight::Put,
+            },
+            vega_per_vp_unit: (o.vega_vp_usd / buy_ct).max(1e-9),
+            units: 1.0,
+            hold_days,
+            theta_vp_day: o.theta_vp_day,
+            buy_depth_contracts: buy_depth,
+            sell_depth_contracts: sell_depth,
+            funding_round_trip_usd: ivarb_quant::funding_round_trip(&o.buy_venue, &o.sell_venue),
+            sell_venue: o.sell_venue.clone(),
+        };
+        let sheet = ivarb_quant::cost_sheet(&input);
+        let cap = ivarb_quant::capital_req(&input);
+        let roc = ivarb_quant::roc_pct(sheet.net_all_in_usd, &cap);
+        // funded? against live paper balances
+        let bal = |v: &str| {
+            st.exec
+                .get()
+                .map(|s| {
+                    s.balances
+                        .iter()
+                        .find(|(b, _)| b == v)
+                        .map(|(_, x)| *x)
+                        .unwrap_or(0.0)
+                })
+                .unwrap_or(0.0)
+        };
+        let funded_buy = bal(&o.buy_venue) >= cap.buy_venue_usd;
+        let funded_sell = bal(&o.sell_venue) >= cap.sell_venue_usd;
+        let buy_v = o.buy_venue.clone();
+        let sell_v = o.sell_venue.clone();
+        Some((sheet, cap, roc, funded_buy, funded_sell, buy_v, sell_v))
+    });
+
+    view! {
+        <div class="exec-plan cost-block">
+            <div class="ep-head">
+                <h4>"Comprehensive cost & capital"</h4>
+                <span class="ep-sub">"per 1 underlying unit — every cost of harvesting this arb, and the collateral it ties up"</span>
+            </div>
+            {move || match analysis.get() {
+                None => view! {
+                    <div class="cb-empty">"Executable premiums not published for this pair — the comprehensive sheet needs live two-sided quotes on both legs."</div>
+                }.into_any(),
+                Some((sheet, cap, roc, funded_buy, funded_sell, buy_v, sell_v)) => {
+                    let rows: Vec<(&'static str, String, &'static str)> = vec![
+                        ("spread locked at entry", fmt::fmt_usd(sheet.gross_locked_usd), "pos"),
+                        ("entry taker fees (both legs)", format!("−{}", fmt::fmt_usd(sheet.entry_fees_usd)), "neg"),
+                        ("exit taker fees (both legs)", format!("−{}", fmt::fmt_usd(sheet.exit_fees_usd)), "neg"),
+                        ("slippage through the touch (entry+exit)", format!("−{}", fmt::fmt_usd(sheet.slippage_usd)), "neg"),
+                        ("margin carry over the hold", format!("−{}", fmt::fmt_usd(sheet.margin_carry_usd)), "neg"),
+                        ("netted theta burn", format!("−{}", fmt::fmt_usd(sheet.theta_burn_usd)), "neg"),
+                        ("funding round-trip (deposit+withdraw)", format!("−{}", fmt::fmt_usd(sheet.funding_usd)), "neg"),
+                        ("TOTAL COST", format!("{} = {} vp", fmt::fmt_usd(sheet.total_usd), fmt::fmt_vp(sheet.total_vp)), "neg"),
+                        ("net after ALL costs", fmt::fmt_usd(sheet.net_all_in_usd), if sheet.net_all_in_usd >= 0.0 { "pos" } else { "neg" }),
+                        ("capital on buy venue", fmt::fmt_usd(cap.buy_venue_usd), ""),
+                        ("capital on sell venue (margin ×1.2)", fmt::fmt_usd(cap.sell_venue_usd), ""),
+                        ("total capital / ROC", format!("{} · {:+.1}%", fmt::fmt_usd(cap.total_usd), roc), ""),
+                    ];
+                    view! {
+                        <div class="ep-grid">
+                            <For each=move || rows.clone() key=|(k, _, _)| *k let:r>
+                                {let (k, v, cls) = r;
+                                 view! {
+                                    <div class="ep-cell">
+                                        <div class="fact-k">{k}</div>
+                                        <div class=format!("fact-v {}", cls)>{v}</div>
+                                    </div>
+                                }}
+                            </For>
+                        </div>
+                        <div class="cb-funded">
+                            {if funded_buy && funded_sell {
+                                view! { <span class="chip ok-chip">"capital: funded on both venues"</span> }.into_any()
+                            } else {
+                                view! {
+                                    <span class="chip warn-chip">
+                                        {format!(
+                                            "deposit needed: {}",
+                                            if !funded_buy && !funded_sell {
+                                                format!("{} and {}", fmt::venue_name(&buy_v), fmt::venue_name(&sell_v))
+                                            } else if !funded_buy {
+                                                fmt::venue_name(&buy_v)
+                                            } else {
+                                                fmt::venue_name(&sell_v)
+                                            }
+                                        )}
+                                    </span>
+                                }.into_any()
+                            }}
+                            <span class="cb-hint">"see section 03 — Funding, costs & capital"</span>
+                        </div>
+                    }.into_any()
+                }
+            }}
+        </div>
     }
 }
 

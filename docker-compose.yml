@@ -1,0 +1,47 @@
+# IVARB — production compose
+#
+#   docker compose up -d          # start (builds if needed)
+#   docker compose logs -f ivarb  # follow the execution log
+#   docker compose down           # stop (positions in paper mode simply end)
+#
+# Put your overrides in .env (see .env.example). NEVER put DERIBIT_API_SECRET
+# in the compose file — use an env file with restricted permissions, or a
+# secrets manager, and only enable live mode after reading docs/DEPLOYMENT.md.
+
+services:
+  ivarb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ivarb:latest
+    container_name: ivarb
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      # Paper mode unless the env file explicitly arms the triple gate
+      # (IVARB_MODE=live + DERIBIT_API_KEY/SECRET + IVARB_LIVE_CONFIRM=yes).
+      IVARB_STATIC_DIR: /opt/ivarb/www
+      IVARB_DATA_DIR: /var/lib/ivarb/data
+    volumes:
+      - ivarb-data:/var/lib/ivarb/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    # Hardening: the container needs no privileges and no new ones
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+
+volumes:
+  ivarb-data:

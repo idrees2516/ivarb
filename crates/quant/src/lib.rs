@@ -4,12 +4,18 @@
 //! can run inside the backend engine and inside the WASM frontend calculator.
 
 mod bs;
+mod cost;
 mod fees;
 mod hold;
 mod iv;
 mod rng;
 
 pub use bs::{bs_delta, bs_price, bs_theta, bs_vega, d1_d2, intrinsic, norm_cdf, norm_pdf};
+pub use cost::{
+    capital_req, cost_sheet, funding_round_trip, margin_per_contract, roc_pct, slippage_frac,
+    CapitalReq, CostInput, CostSheet, FundingRail, FUNDING_RAILS, MARGIN_BUFFER,
+    MARGIN_CARRY_RATE, THETA_NETTING,
+};
 pub use fees::{fee_vp, vega_per_vp};
 pub use hold::{
     analyze as hold_analyze, analyze_lite as hold_analyze_lite, expected_terminal_payoff,
@@ -18,6 +24,9 @@ pub use hold::{
 };
 pub use iv::implied_vol;
 pub use rng::Rng;
+
+/// Re-exported for downstream users of the cost model.
+pub use Right as QuantRight;
 
 #[cfg(test)]
 mod tests;

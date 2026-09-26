@@ -12,6 +12,7 @@
 //! - `GET /api/exec`      — advantage-taker state
 //! - `POST /api/exec/cmd` — control the advantage taker
 //! - `GET /healthz`       — liveness probe
+//! - `GET /metrics`       — Prometheus exposition (engine + taker)
 //!
 //! Engine→client frames are serialized exactly once and fanned out through a
 //! broadcast channel; snapshots are read wait-free from ArcSwap.
@@ -89,6 +90,13 @@ async fn main() -> anyhow::Result<()> {
     let cfg = EngineConfig::from_env();
     std::fs::create_dir_all(&cfg.data_dir)?;
     let data_dir = cfg.data_dir.clone();
+    // Executor cadences (IVARB_EXEC_* overrides) — captured before the
+    // engine consumes the config.
+    let (exec_scan_ms, exec_monitor_ms, exec_push_ms) = (
+        cfg.exec_scan_ms,
+        cfg.exec_monitor_ms,
+        cfg.exec_push_ms,
+    );
     let handles = spawn_engine(cfg)?;
 
     // The advantage taker: consumes engine snapshots, watches live legs,
@@ -99,6 +107,10 @@ async fn main() -> anyhow::Result<()> {
         watch_tx: handles.watch_tx.clone(),
         bcast: handles.bcast.clone(),
         shutdown: handles.shutdown.subscribe(),
+        opps_light: handles.opps_light.clone(),
+        scan_ms: exec_scan_ms,
+        monitor_ms: exec_monitor_ms,
+        push_ms: exec_push_ms,
     });
 
     let state = AppState {
@@ -148,7 +160,9 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Static frontend + routes.
-    let dist = PathBuf::from("frontend/dist");
+    let dist = PathBuf::from(
+        std::env::var("IVARB_STATIC_DIR").unwrap_or_else(|_| "frontend/dist".into()),
+    );
     let index = dist.join("index.html");
     let app = if index.exists() {
         let serve = tower_http::services::ServeDir::new(&dist)
@@ -165,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/exec", get(api_exec))
             .route("/api/exec/cmd", post(api_exec_cmd))
             .route("/healthz", get(healthz))
+            .route("/metrics", get(metrics))
             .fallback_service(serve)
             .with_state(state)
     } else {
@@ -180,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/exec", get(api_exec))
             .route("/api/exec/cmd", post(api_exec_cmd))
             .route("/healthz", get(healthz))
+            .route("/metrics", get(metrics))
             .fallback(get(frontend_missing))
             .with_state(state)
     };
@@ -224,6 +240,68 @@ async fn main() -> anyhow::Result<()> {
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true, "ts": now_ms() }))
+}
+
+/// Prometheus text exposition — engine health/perf + taker P&L/risk, in one
+/// scrape. Gauge-style snapshots read wait-free from ArcSwap; designed for a
+/// 15-30s scrape interval and alerting on exactly the numbers the ops
+/// runbook cares about (venues live, loop latency, capture, drawdown).
+async fn metrics(State(st): State<AppState>) -> (StatusCode, [(axum::http::HeaderName, &'static str); 2], String) {
+    let mut s = String::with_capacity(4096);
+    let snap = st.snapshot.load();
+    let es = &snap.stats;
+    let mut m = |name: &str, help: &str, value: String| {
+        s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"));
+    };
+    m("ivarb_up", "server is up", "1".into());
+    m("ivarb_uptime_seconds", "engine uptime", format!("{:.0}", es.uptime_s));
+    m("ivarb_venues_live", "venues reporting live data", format!("{}", es.venues_live));
+    m("ivarb_venues_total", "venues configured", format!("{}", es.venues_total));
+    m("ivarb_instruments_tracked", "option instruments tracked", format!("{}", es.instruments_tracked));
+    m("ivarb_opps_active", "active fee-adjusted opportunities", format!("{}", es.opps_active));
+    m("ivarb_engine_loop_us_ewma", "engine scan loop, EWMA microseconds", format!("{:.1}", es.engine_loop_us_ewma));
+    m("ivarb_msg_rate", "inbound feed messages per second", format!("{:.0}", es.msg_rate));
+    m("ivarb_pipe_p50_us", "quote-to-snapshot p50, microseconds", format!("{:.0}", es.pipe_p50_us));
+    m("ivarb_pipe_p99_us", "quote-to-snapshot p99, microseconds", format!("{:.0}", es.pipe_p99_us));
+    m("ivarb_pipe_p999_us", "quote-to-snapshot p99.9, microseconds", format!("{:.0}", es.pipe_p999_us));
+    m("ivarb_multihop_routes", "live multi-hop routes", format!("{}", es.multihop_routes));
+    m("ivarb_holds_tracked", "hold-lab candidates tracked", format!("{}", es.holds_tracked));
+    drop(snap);
+    let exec = st.exec_snap.load();
+    let x = &exec.stats;
+    m("ivarb_exec_armed", "advantage taker armed (1/0)", format!("{}", x.armed as u8));
+    m("ivarb_exec_mode_live", "taker in live mode (1/0)", format!("{}", (x.mode == ivarb_protocol::ExecMode::Live) as u8));
+    m("ivarb_exec_kill", "kill switch tripped (1/0)", format!("{}", x.kill.is_some() as u8));
+    m("ivarb_exec_positions_open", "open positions", format!("{}", x.positions_open));
+    m("ivarb_exec_attempts_total", "attempts lifetime", format!("{}", x.attempts_total));
+    m("ivarb_exec_fills_total", "fills lifetime", format!("{}", x.fills_total));
+    m("ivarb_exec_single_leg_events", "single-leg events lifetime", format!("{}", x.single_leg_events));
+    m("ivarb_exec_realized_usd", "realized P&L, USD", format!("{:.2}", x.realized_usd));
+    m("ivarb_exec_unrealized_usd", "unrealized P&L, USD", format!("{:.2}", x.unrealized_usd));
+    m("ivarb_exec_fees_usd", "total fees paid, USD", format!("{:.2}", x.fees_usd));
+    m("ivarb_exec_equity_usd", "account equity, USD", format!("{:.2}", x.equity_usd));
+    m("ivarb_exec_net_deposits_usd", "net lifetime deposits, USD", format!("{:.2}", x.net_deposits_usd));
+    m("ivarb_exec_capital_reserved_usd", "capital reserved by open positions, USD", format!("{:.2}", x.capital_reserved_usd));
+    m("ivarb_exec_vega_used_usd", "aggregate vega exposure, USD/vp", format!("{:.2}", x.vega_used_usd));
+    m("ivarb_exec_capture_ratio", "realized vs signaled edge, fraction", format!("{:.3}", x.capture_ratio));
+    m("ivarb_exec_trades_closed", "trades closed lifetime", format!("{}", x.trades_closed));
+    m("ivarb_exec_wins", "winning trades", format!("{}", x.wins));
+    m("ivarb_exec_losses", "losing trades", format!("{}", x.losses));
+    m("ivarb_exec_profit_factor", "gross wins / gross losses", {
+        if x.profit_factor.is_finite() { format!("{:.3}", x.profit_factor) } else { "0".into() }
+    });
+    drop(exec);
+    (
+        StatusCode::OK,
+        [(
+            axum::http::HeaderName::from_static("content-type"),
+            "text/plain; version=0.0.4",
+        ), (
+            axum::http::HeaderName::from_static("cache-control"),
+            "no-store",
+        )],
+        s,
+    )
 }
 
 async fn api_snapshot(State(st): State<AppState>) -> Json<Snapshot> {

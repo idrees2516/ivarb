@@ -1,0 +1,58 @@
+# IVARB — systemd unit (bare-metal / VM deployment)
+#
+# Install:
+#   sudo cp deploy/ivarb.service /etc/systemd/system/
+#   sudo mkdir -p /opt/ivarb /var/lib/ivarb
+#   sudo cp target/release/ivarb-server /opt/ivarb/
+#   sudo cp -r frontend/dist /opt/ivarb/www
+#   sudo cp .env.example /etc/ivarb.env && sudo nano /etc/ivarb.env   # your overrides
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ivarb
+#
+# Follow:  journalctl -u ivarb -f
+# Status:  systemctl status ivarb ; curl -s localhost:3000/healthz
+
+[Unit]
+Description=IVARB — cross-exchange IV arbitrage platform
+Documentation=file:///opt/ivarb/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ivarb
+Group=ivarb
+WorkingDirectory=/var/lib/ivarb
+EnvironmentFile=-/etc/ivarb.env
+Environment=IVARB_STATIC_DIR=/opt/ivarb/www
+Environment=IVARB_DATA_DIR=/var/lib/ivarb/data
+ExecStart=/opt/ivarb/ivarb-server
+ExecReload=/bin/kill -HUP $MAINPID
+
+# The server traps SIGTERM and shuts down gracefully (stops attempts,
+# releases watches, flushes the audit log).
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Resilience
+Restart=always
+RestartSec=3
+StartLimitBurst=10
+StartLimitIntervalSec=60
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/ivarb
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

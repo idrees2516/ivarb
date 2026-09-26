@@ -21,7 +21,7 @@ pub fn GaSection() -> impl IntoView {
 
     view! {
         <section class="section" id="ga">
-            <crate::app::SectionHead num="05"
+            <crate::app::SectionHead num="06"
                 title="Genetic strategy optimizer — parameters that evolve against live tape"
                 sub="Every signal episode is recorded to a tape. A genetic algorithm replays that tape thousands of times per generation, mutating and crossing over the strategy genome, and keeps the parameter set with the best risk-adjusted capture. You decide when it drives the live gates."/>
             {move || {

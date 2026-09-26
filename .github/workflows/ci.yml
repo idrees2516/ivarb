@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Backend: full workspace test suite (quant, engine, executor).
+  test:
+    name: cargo test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --workspace --release
+      - name: Release build
+        run: cargo build --release --bin ivarb-server
+
+  # Frontend: Leptos WASM dashboard must compile via trunk.
+  frontend:
+    name: trunk build (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install trunk + wasm-bindgen
+        run: |
+          cargo install --locked trunk --version 0.21.14 --no-default-features --features rustls
+          cargo install --locked wasm-bindgen-cli --version 0.2.128
+      - name: Build dashboard
+        working-directory: frontend
+        run: trunk build --release
+
+  # Docker image builds end-to-end (backend + frontend + runtime layer).
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t ivarb:ci .
+      - name: Smoke test (server boots, healthz answers)
+        run: |
+          docker run -d --name ivarb-ci -p 3000:3000 ivarb:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/healthz; then echo "OK"; break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:3000/healthz
+          docker rm -f ivarb-ci

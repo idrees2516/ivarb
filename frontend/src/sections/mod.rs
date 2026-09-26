@@ -1,5 +1,6 @@
 pub mod calc;
 pub mod detail;
+pub mod funding;
 pub mod ga;
 pub mod holdlab;
 pub mod multihop;

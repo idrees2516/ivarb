@@ -5,7 +5,7 @@
 use leptos::prelude::*;
 
 use crate::fmt;
-use crate::sections::{calc, ga, holdlab, multihop, risk, scanner, steps, taker, venues};
+use crate::sections::{calc, funding, ga, holdlab, multihop, risk, scanner, steps, taker, venues};
 use crate::state::{ApiState, WsState};
 
 #[component]
@@ -22,6 +22,7 @@ pub fn App() -> impl IntoView {
                 <scanner::ScannerSection/>
                 <LegendSection/>
                 <taker::TakerSection/>
+                <funding::FundingSection/>
                 <holdlab::HoldLabSection/>
                 <multihop::MultihopSection/>
                 <ga::GaSection/>
