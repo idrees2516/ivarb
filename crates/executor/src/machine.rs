@@ -18,6 +18,7 @@ use rustc_hash::FxHashMap;
 
 use ivarb_protocol::{ExecEvent, ExecLevel, ExecSettings, Opportunity, Snapshot, WatchedLeg};
 
+use crate::gateways::VenueRouter;
 use crate::paper::{Fill, PaperBroker, Side};
 use crate::now_ms;
 
@@ -32,10 +33,35 @@ pub struct AttemptCtx {
     pub buy_ct: f64,
     pub sell_ct: f64,
     pub broker: Arc<PaperBroker>,
+    /// Paper-vs-live venue dispatch (real gateways when live mode armed).
+    pub router: Arc<ArcSwap<VenueRouter>>,
     pub watched: Arc<ArcSwap<FxHashMap<String, Vec<WatchedLeg>>>>,
     pub snapshot: Arc<ArcSwap<Snapshot>>,
     pub events: tokio::sync::mpsc::UnboundedSender<ExecEvent>,
     pub settings: ExecSettings,
+}
+
+impl AttemptCtx {
+    /// Taker fill through the venue router — a REAL gateway order when
+    /// live mode is armed and the venue has a gateway, the paper broker
+    /// otherwise. Drop-in replacement for the old `broker.take` calls.
+    #[allow(clippy::too_many_arguments)]
+    async fn take(
+        &self,
+        venue: &str,
+        side: Side,
+        touch: f64,
+        depth: f64,
+        want_contracts: f64,
+        fee_rate: f64,
+        spot: f64,
+        ct: f64,
+    ) -> Fill {
+        let router = self.router.load_full();
+        router
+            .take(venue, &self.inst(), side, touch, depth, want_contracts, fee_rate, spot, ct)
+            .await
+    }
 }
 
 impl AttemptCtx {
@@ -218,7 +244,6 @@ pub async fn run_sniper(ctx: AttemptCtx, units: f64) -> AttemptOutcome {
     // --- leg A: buy on the cheaper venue (fire the thinner side first) ------
     let want_buy_contracts = units / ctx.buy_ct;
     let fill_a: Fill = ctx
-        .broker
         .take(
             &o.buy_venue,
             Side::Buy,
@@ -256,7 +281,7 @@ pub async fn run_sniper(ctx: AttemptCtx, units: f64) -> AttemptOutcome {
     let timeout = Duration::from_secs_f64(ctx.settings.leg_timeout_s.max(1.0));
     let fill_b = match tokio::time::timeout(
         timeout,
-        ctx.broker.take(
+        ctx.take(
             &o.sell_venue,
             Side::Sell,
             sell_touch,
@@ -284,7 +309,6 @@ pub async fn run_sniper(ctx: AttemptCtx, units: f64) -> AttemptOutcome {
             ),
         );
         let unwind = ctx
-            .broker
             .take(
                 &o.buy_venue,
                 Side::Sell,
@@ -343,7 +367,6 @@ pub async fn run_sniper(ctx: AttemptCtx, units: f64) -> AttemptOutcome {
         );
         let excess_contracts = excess_units / ctx.buy_ct;
         let shed = ctx
-            .broker
             .take(
                 &o.buy_venue,
                 Side::Sell,
@@ -552,7 +575,6 @@ pub async fn run_convergence(ctx: AttemptCtx, units: f64) -> AttemptOutcome {
                 if exec_edge_vp >= 0.10 {
                     ctx.ev(ExecLevel::Info, "leg_b", format!("taking leg B at market — remaining edge {:+.2} vp", exec_edge_vp));
                     let f = ctx
-                        .broker
                         .take(
                             &o.sell_venue,
                             Side::Sell,
@@ -583,7 +605,6 @@ pub async fn run_convergence(ctx: AttemptCtx, units: f64) -> AttemptOutcome {
                 }
                 // Unwind the passive fill.
                 let unwind = ctx
-                    .broker
                     .take(
                         &o.buy_venue,
                         Side::Sell,

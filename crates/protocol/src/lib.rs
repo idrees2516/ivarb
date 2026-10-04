@@ -571,6 +571,20 @@ pub enum ExecCommand {
     /// sell back) to prove the live order path end-to-end. Live mode only;
     /// costs the spread + fees (typically a few USD on 0.1 BTC).
     LiveSmokeTest { instrument: Option<String> },
+    /// Execute a real on-chain Uniswap V3 swap through the EVM gateway
+    /// (WETH ↔ USDC on base / arbitrum / optimism / ethereum). Quotes from
+    /// the live QuoterV2, builds the SwapRouter02 calldata, and — when
+    /// IVARB_CHAIN_SIGNER_KEY is set — signs and broadcasts for real.
+    ChainSwap {
+        chain: String,
+        /// true = sell WETH for USDC, false = sell USDC for WETH.
+        weth_in: bool,
+        /// Human-unit amount (ETH or USDC).
+        amount: f64,
+    },
+    /// Refresh per-venue gateway health + on-chain chain status (chainId,
+    /// block, gas, live quote probe). Read-only — never orders.
+    ChainStatusRefresh,
 }
 
 /// Live-gateway readiness, published in every executor snapshot.
@@ -594,6 +608,59 @@ pub struct LiveStatus {
     pub blockers: Vec<String>,
     /// Last preflight report lines ("name: OK detail" / "name: FAIL detail").
     pub last_preflight: Vec<String>,
+    /// Per-venue gateway state (credentials detected / gateway healthy).
+    pub venues: Vec<VenueGateStatus>,
+    /// On-chain state per configured chain (live probes).
+    pub chains: Vec<ChainStatusOut>,
+    /// Chain signer address derived from IVARB_CHAIN_SIGNER_KEY (if set).
+    pub chain_signer: Option<String>,
+    /// Most recent on-chain swap outcomes, newest last (kept small).
+    pub swaps: Vec<ChainSwapRecord>,
+}
+
+/// Per-venue live gateway state (mirrors the executor's VenueGateStatus).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct VenueGateStatus {
+    pub venue: String,
+    /// Credentials detected in env.
+    pub creds: bool,
+    /// Gateway constructed and healthy.
+    pub healthy: bool,
+    /// Human detail — never secrets.
+    pub detail: String,
+}
+
+/// On-chain chain status as published to the UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ChainStatusOut {
+    pub name: String,
+    /// eth_chainId matched the configured value.
+    pub ok: bool,
+    pub block: u64,
+    /// Live 0.01 WETH → USDC quote (USDC units).
+    pub weth_usdc_out: f64,
+    /// Implied on-chain ETH price (USD).
+    pub eth_price: f64,
+    pub gas_gwei: f64,
+    pub rpc_ms: u32,
+}
+
+/// An executed (or payload-built) on-chain swap, for the event feed + UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ChainSwapRecord {
+    pub t_ms: i64,
+    pub chain: String,
+    pub direction: String,
+    pub amount_in: f64,
+    /// QuoterV2 live quote for the input amount.
+    pub quoted_out: f64,
+    pub min_out: f64,
+    pub tx_hash: Option<String>,
+    /// True when the swap was broadcast (signer key present).
+    pub broadcast: bool,
+    /// Calldata hex, ready for any wallet when not broadcast.
+    pub calldata_hex: String,
+    pub note: String,
 }
 
 pub type HistoryPt = (i64, f64);

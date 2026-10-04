@@ -22,7 +22,7 @@ dashboard — no Node, no Python, no browser-side crypto.
 | **Venues** | deribit, okx, bybit, binance, delta, aevo, derive, thalex (auto-disable on failure) |
 | **Instruments** | ~5,000+ live options across BTC / ETH / SOL |
 | **Edge model** | Executable-touch premium truth (forward-basis-proof), fee-adjusted vol points |
-| **Execution** | Paper (realistic latency/slippage/partials) and Deribit live (triple-gated) |
+| **Execution** | Paper (realistic latency/slippage/partials) + live gateways: Deribit WS, Bybit V5, OKX v5, Binance eapi (triple-gated) + on-chain Uniswap V3 swaps on Base/Arbitrum/Optimism/Ethereum |
 | **Tests** | 59 unit/integration tests across quant, engine, executor |
 | **Runtime footprint** | Single process, ~80 MB RSS, µs-level scan loop |
 
@@ -63,7 +63,8 @@ crates/
               timing tiers, OU/Kalman analytics, hold lab, multi-hop,
               genetic optimizer, sim feed
   executor/   Advantage taker: risk preflight, SNIPER/CONVERGENCE state
-              machines, paper broker, Deribit live gateway, route
+              machines, paper broker, venue router (Deribit/Bybit/
+              OKX/Binance live gateways + EVM chain gateway), route
               calibration, delta hedger
   server/     Axum HTTP/WS server, REST API, Prometheus /metrics, static
               frontend, JSONL audit writer, graceful shutdown
@@ -133,6 +134,7 @@ arming procedure.
 | [docs/COSTS-AND-CAPITAL.md](docs/COSTS-AND-CAPITAL.md) | Comprehensive cost sheets, margin formulas, funding rails, capital requirements, profit attribution |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, compose, systemd, env reference, monitoring, ops runbook |
 | [docs/API.md](docs/API.md) | REST + WebSocket reference |
+| [docs/LIVE-TRADING.md](docs/LIVE-TRADING.md) | Real-venue gateways (Deribit/Bybit/OKX/Binance) + on-chain EVM/Uniswap execution: setup, safety model, verification |
 
 ## License
 

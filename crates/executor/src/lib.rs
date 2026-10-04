@@ -13,6 +13,7 @@
 //!   channel, serialized exactly once per push.
 
 pub mod calib;
+pub mod gateways;
 pub mod live;
 pub mod machine;
 pub mod paper;
@@ -39,6 +40,7 @@ use machine::{AttemptCtx, AttemptOutcome, PositionDraft};
 use paper::PaperBroker;
 use risk::{canonical_inst, RiskState};
 use route::{RouteCtx, RouteOutcome};
+use gateways::VenueRouter;
 
 /// Serialized engine snapshots start with this prefix (`ServerMsg` is
 /// internally tagged) — used to detect "fresh data" on the broadcast bus
@@ -135,7 +137,12 @@ struct Core {
     live_tx: mpsc::UnboundedSender<LiveMsg>,
     live_rx: mpsc::UnboundedReceiver<LiveMsg>,
     broker: Arc<PaperBroker>,
-    /// Authenticated Deribit session, once the arming chain completes.
+    /// Venue router — the one dispatch point deciding paper vs REAL venue
+    /// gateways (Deribit WS / Bybit V5 / OKX v5 / Binance eapi) per leg.
+    /// Swapped atomically whenever gateways (re)connect.
+    router: Arc<ArcSwap<VenueRouter>>,
+    /// Authenticated Deribit session, once the arming chain completes
+    /// (mirrored from the router for the legacy status fields).
     deribit: Option<Arc<live::DeribitSession>>,
     /// Live-gateway readiness published to the UI.
     live: LiveStatus,
@@ -176,6 +183,12 @@ enum LiveMsg {
     Connected(Arc<live::DeribitSession>),
     Failed(String),
     Preflight(Vec<live::LiveCheck>),
+    /// A freshly connected venue-router (gateways built from env creds).
+    Router(Arc<VenueRouter>, Vec<gateways::VenueGateStatus>),
+    /// Refreshed on-chain status (per chain).
+    Chains(Vec<gateways::evm::ChainStatus>),
+    /// Result of an on-chain swap execution.
+    SwapDone(Result<gateways::evm::SwapOutcome, String>),
 }
 
 /// Boot the advantage taker.
@@ -213,8 +226,15 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
     let (deps_scan_ms, deps_monitor_ms, deps_push_ms) = (deps.scan_ms, deps.monitor_ms, deps.push_ms);
     let opps_light = deps.opps_light.clone();
 
+    // Shared paper broker: every paper fill from the router lands in the
+    // same balances the treasury/capital gates read.
+    let broker = Arc::new(PaperBroker::new(&venue_ids, 250_000.0));
     let mut core = Core {
-        broker: Arc::new(PaperBroker::new(&venue_ids, 250_000.0)),
+        router: Arc::new(ArcSwap::from_pointee(VenueRouter::new(
+            broker.clone(),
+            arming.fully_armed(),
+        ))),
+        broker,
         settings: profile_settings(),
         armed: false,
         kill: None,
@@ -298,23 +318,9 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
             ExecLevel::Warn,
             "live",
             format!(
-                "LIVE ARMING GATES OK — connecting Deribit session at {}",
-                arming.ws_url
+                "LIVE ARMING GATES OK — connecting venue gateways (deribit/bybit/okx/binance from env credentials) + chain status"
             ),
         );
-        let (k, s) = arming.keys.clone().unwrap();
-        let ws = arming.ws_url.clone();
-        let tx = live_tx.clone();
-        tokio::spawn(async move {
-            match live::DeribitSession::connect_ws(&ws, &k, &s).await {
-                Ok(sess) => {
-                    let _ = tx.send(LiveMsg::Connected(sess));
-                }
-                Err(e) => {
-                    let _ = tx.send(LiveMsg::Failed(e.to_string()));
-                }
-            }
-        });
     } else if arming.requested {
         core.ev(
             None,
@@ -330,8 +336,35 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
             None,
             ExecLevel::Info,
             "live",
-            "paper mode (simulated fills) — going live needs IVARB_MODE=live + DERIBIT_API_KEY/SECRET + IVARB_LIVE_CONFIRM=yes; run LIVE PREFLIGHT anytime to check".into(),
+            "paper mode (simulated fills) — going live needs IVARB_MODE=live + venue API keys + IVARB_LIVE_CONFIRM=yes; run LIVE PREFLIGHT anytime to check".into(),
         );
+    }
+
+    // ---- connect every venue gateway whose credentials are present ----
+    // (read-only pings/auth; orders only ever fire when fully armed). The
+    // resulting router is swapped in atomically and published to the UI.
+    {
+        let tx = live_tx.clone();
+        let paper = core.broker.clone();
+        let armed = arming.fully_armed();
+        tokio::spawn(async move {
+            let mut r = VenueRouter::new(paper, armed);
+            let venues = r.connect_all().await;
+            let _ = tx.send(LiveMsg::Router(Arc::new(r), venues));
+        });
+    }
+    // ---- on-chain status probe (real RPC + real Uniswap quotes) --------
+    {
+        let tx = live_tx.clone();
+        let router0 = core.router.clone();
+        tokio::spawn(async move {
+            let r = router0.load_full();
+            let mut out = Vec::new();
+            for c in &r.evm.chains {
+                out.push(r.evm.chain_status(c.name).await);
+            }
+            let _ = tx.send(LiveMsg::Chains(out));
+        });
     }
 
     // ---- auto-arm (automatic arb taking) --------------------------------
@@ -428,7 +461,7 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
                         core.scan_with(&opps_light);
                     }
                 }
-                _ = monitor.tick() => core.monitor(),
+                _ = monitor.tick() => core.monitor().await,
                 _ = push.tick() => {
                     if core.dirty {
                         core.publish();
@@ -632,15 +665,63 @@ impl Core {
                 }
             }
             ExecCommand::LivePreflight => {
-                self.ev(None, ExecLevel::Info, "live", "preflight: checking arming gates, Deribit credentials and account…".into());
+                self.ev(None, ExecLevel::Info, "live", "preflight: checking arming gates, venue credentials/gateways and on-chain RPC…".into());
                 let tx = self.live_tx.clone();
                 tokio::spawn(async move {
                     let checks = live::live_preflight().await;
                     let _ = tx.send(LiveMsg::Preflight(checks));
                 });
+                // Rebuild the venue router + refresh chain status in the
+                // same pass (read-only: pings, auth, account reads).
+                let tx = self.live_tx.clone();
+                let paper = self.broker.clone();
+                let armed = matches!(self.mode, ExecMode::Live);
+                tokio::spawn(async move {
+                    let mut r = VenueRouter::new(paper, armed);
+                    let venues = r.connect_all().await;
+                    let _ = tx.send(LiveMsg::Router(Arc::new(r), venues));
+                });
+                let tx = self.live_tx.clone();
+                let router0 = self.router.clone();
+                tokio::spawn(async move {
+                    let r = router0.load_full();
+                    let mut out = Vec::new();
+                    for c in &r.evm.chains {
+                        out.push(r.evm.chain_status(c.name).await);
+                    }
+                    let _ = tx.send(LiveMsg::Chains(out));
+                });
             }
             ExecCommand::LiveSmokeTest { instrument } => {
                 self.live_smoke_test(instrument);
+            }
+            ExecCommand::ChainSwap { chain, weth_in, amount } => {
+                self.ev(
+                    None,
+                    ExecLevel::Info,
+                    "chain",
+                    format!("swap requested: {chain} {} {:.6}", if weth_in { "WETH → USDC" } else { "USDC → WETH" }, amount),
+                );
+                let tx = self.live_tx.clone();
+                let router0 = self.router.clone();
+                tokio::spawn(async move {
+                    let r = router0.load_full();
+                    let res = r.evm.execute_swap(&chain, weth_in, amount).await;
+                    let _ = tx.send(LiveMsg::SwapDone(res.map_err(|e| e.to_string())));
+                });
+            }
+            ExecCommand::ChainStatusRefresh => {
+                self.ev(None, ExecLevel::Info, "chain", "refreshing on-chain status (RPC + live quotes)…".into());
+                let tx = self.live_tx.clone();
+                let router0 = self.router.clone();
+                tokio::spawn(async move {
+                    let r = router0.load_full();
+                    let mut out = Vec::new();
+                    for c in &r.evm.chains {
+                        out.push(r.evm.chain_status(c.name).await);
+                    }
+                    let _ = tx.send(LiveMsg::Chains(out));
+                });
             }
         }
         self.dirty = true;
@@ -664,13 +745,9 @@ impl Core {
     // live path (authenticated Deribit scaffold)
     // ------------------------------------------------------------------
 
-    /// Venues with an authenticated order gateway (Deribit today).
+    /// Venues with an authenticated order gateway.
     fn live_gateways(&self) -> u32 {
-        if self.deribit.is_some() {
-            1
-        } else {
-            0
-        }
+        self.router.load().gateway_count()
     }
 
     /// Two-leg routes are only executable live when BOTH legs sit behind a
@@ -688,20 +765,8 @@ impl Core {
         if !matches!(self.mode, ExecMode::Live) {
             return Ok(());
         }
-        let deribit_up = self.deribit.is_some();
-        let ok = |v: &str| deribit_up && v == "deribit";
-        let (b, s) = (ok(&opp.buy_venue), ok(&opp.sell_venue));
-        if b && s {
-            Ok(())
-        } else {
-            Err(format!(
-                "live route incomplete — buy venue {} {}, sell venue {} {}; a paper leg inside a live attempt is forbidden (a second venue gateway completes the route)",
-                opp.buy_venue,
-                if b { "LIVE" } else { "no gateway" },
-                opp.sell_venue,
-                if s { "LIVE" } else { "no gateway" },
-            ))
-        }
+        let router = self.router.load();
+        router.route_live_ok(&[opp.buy_venue.clone(), opp.sell_venue.clone()])
     }
 
     fn handle_live_msg(&mut self, m: LiveMsg) {
@@ -754,6 +819,121 @@ impl Core {
                     ),
                 );
             }
+            LiveMsg::Router(router, venues) => {
+                // Mirror deribit for the legacy status fields.
+                let deribit_up = router.deribit.is_some();
+                self.deribit = router.deribit.clone();
+                self.live.session_up = deribit_up;
+                self.route_warned = false;
+                self.live.venues = venues
+                    .iter()
+                    .map(|v| ivarb_protocol::VenueGateStatus {
+                        venue: v.venue.clone(),
+                        creds: v.creds,
+                        healthy: v.healthy,
+                        detail: v.detail.clone(),
+                    })
+                    .collect();
+                self.live.chain_signer = router.evm.signer_address();
+                self.router.store(router);
+                let up: Vec<&str> = venues.iter().filter(|v| v.healthy).map(|v| v.venue.as_str()).collect();
+                let creds: Vec<&str> = venues.iter().filter(|v| v.creds).map(|v| v.venue.as_str()).collect();
+                let n = up.len();
+                self.ev(
+                    None,
+                    if n > 0 { ExecLevel::Ok } else { ExecLevel::Info },
+                    "live",
+                    format!(
+                        "venue gateways: {} live-capable ({}) — credentials detected for {}",
+                        n,
+                        if up.is_empty() { "none".into() } else { up.join(", ") },
+                        if creds.is_empty() { "none".into() } else { creds.join(", ") },
+                    ),
+                );
+                for v in &venues {
+                    if v.creds && !v.healthy {
+                        self.ev(None, ExecLevel::Warn, "live", format!("{} gateway UNHEALTHY: {}", v.venue, v.detail));
+                    }
+                }
+                if let Some(signer) = &self.live.chain_signer {
+                    self.ev(
+                        None,
+                        ExecLevel::Warn,
+                        "chain",
+                        format!("on-chain signer {signer} loaded from IVARB_CHAIN_SIGNER_KEY — CHAIN SWAP will broadcast REAL transactions"),
+                    );
+                }
+            }
+            LiveMsg::Chains(statuses) => {
+                self.live.chains = statuses
+                    .iter()
+                    .map(|c| ivarb_protocol::ChainStatusOut {
+                        name: c.name.clone(),
+                        ok: c.chain_id_ok && c.quote_ok,
+                        block: c.block,
+                        weth_usdc_out: c.weth_usdc_out,
+                        eth_price: c.eth_price,
+                        gas_gwei: c.gas_gwei,
+                        rpc_ms: c.rpc_ms,
+                    })
+                    .collect();
+                let live_chains: Vec<String> = statuses
+                    .iter()
+                    .filter(|c| c.chain_id_ok && c.quote_ok)
+                    .map(|c| format!("{} (eth ${:.0}, {:.2} gwei, block {})", c.name, c.eth_price, c.gas_gwei, c.block))
+                    .collect();
+                if live_chains.is_empty() {
+                    self.ev(None, ExecLevel::Warn, "chain", "no chains reachable — check RPC endpoints (IVARB_RPC_*)".into());
+                } else {
+                    self.ev(
+                        None,
+                        ExecLevel::Info,
+                        "chain",
+                        format!("chains LIVE: {}", live_chains.join(" · ")),
+                    );
+                }
+            }
+            LiveMsg::SwapDone(res) => match res {
+                Ok(o) => {
+                    let rec = ivarb_protocol::ChainSwapRecord {
+                        t_ms: now_ms(),
+                        chain: o.chain.clone(),
+                        direction: o.direction.clone(),
+                        amount_in: o.amount_in,
+                        quoted_out: o.quoted_out,
+                        min_out: o.min_out,
+                        tx_hash: o.tx_hash.clone(),
+                        broadcast: o.broadcast,
+                        calldata_hex: o.calldata_hex.clone(),
+                        note: o.note.clone(),
+                    };
+                    self.live.swaps.push(rec);
+                    while self.live.swaps.len() > 10 {
+                        self.live.swaps.remove(0);
+                    }
+                    self.ev(
+                        None,
+                        ExecLevel::Ok,
+                        "chain",
+                        format!(
+                            "swap {} {} {:.6} → quoted {:.4} (min {:.4}){} — {}",
+                            o.chain,
+                            o.direction,
+                            o.amount_in,
+                            o.quoted_out,
+                            o.min_out,
+                            match &o.tx_hash {
+                                Some(h) => format!(" · tx {h}"),
+                                None => " · NOT broadcast (no signer key — calldata ready)".to_string(),
+                            },
+                            o.note,
+                        ),
+                    );
+                }
+                Err(e) => {
+                    self.ev(None, ExecLevel::Error, "chain", format!("swap FAILED: {e}"));
+                }
+            },
         }
         self.dirty = true;
     }
@@ -1058,10 +1238,9 @@ impl Core {
             return;
         }
         if matches!(self.mode, ExecMode::Live) {
-            // Route cycles execute through the paper fill engine; a paper
-            // leg inside a live attempt is forbidden, so live mode runs no
-            // route cycles until every leg's venue has a live gateway.
-            return;
+            // Live route cycles need EVERY leg's venue behind a real
+            // gateway — a paper leg inside a live attempt is forbidden.
+            // (Auto-fire scans candidates below and filters per route.)
         }
         const MAX_CONCURRENT_ROUTES: usize = 2;
         if self.route_active.len() >= MAX_CONCURRENT_ROUTES || snap.multihop.is_empty() {
@@ -1089,6 +1268,14 @@ impl Core {
             if self.calib.flicker(&chain) {
                 continue;
             }
+            // Live doctrine: every leg's venue must sit behind a real
+            // gateway before a route cycle can fire in live mode.
+            if matches!(self.mode, ExecMode::Live) {
+                let venues: Vec<String> = r.legs.iter().map(|l| l.venue.clone()).collect();
+                if self.router.load().route_live_ok(&venues).is_err() {
+                    continue;
+                }
+            }
             // Expectation gate: raw profit × data confidence × learned
             // route capture must clear the configured floor.
             let expected = r.total_usd * r.quality * self.calib.edge_mult(&chain);
@@ -1104,6 +1291,19 @@ impl Core {
     /// switch, live-mode doctrine and every capital gate.
     fn try_fire_route(&mut self, route: &MultiHopRoute, manual: bool, now: i64) {
         let snap = self.deps.snapshot.load();
+        // Single entry gate for live doctrine (covers auto + manual paths).
+        if matches!(self.mode, ExecMode::Live) {
+            let venues: Vec<String> = route.legs.iter().map(|l| l.venue.clone()).collect();
+            if let Err(reason) = self.router.load().route_live_ok(&venues) {
+                self.ev(
+                    Some(route.id.clone()),
+                    ExecLevel::Error,
+                    "route",
+                    format!("live route refused: {reason}"),
+                );
+                return;
+            }
+        }
         let spot = snap
             .spots
             .iter()
@@ -1281,6 +1481,7 @@ impl Core {
             spot,
             settings: self.settings.clone(),
             broker: self.broker.clone(),
+            router: self.router.clone(),
             watched: self.deps.watched.clone(),
             snapshot: self.deps.snapshot.clone(),
             events: self.event_tx.clone(),
@@ -1307,8 +1508,11 @@ impl Core {
             return;
         }
         if matches!(self.mode, ExecMode::Live) {
-            self.ev(Some(route_id.to_string()), ExecLevel::Error, "route", "route cycles run on the paper fill engine — live multi-leg routing activates when every leg's venue has a live gateway".into());
-            return;
+            let venues: Vec<String> = r.legs.iter().map(|l| l.venue.clone()).collect();
+            if let Err(reason) = self.router.load().route_live_ok(&venues) {
+                self.ev(Some(route_id.to_string()), ExecLevel::Error, "route", format!("live route refused: {reason}"));
+                return;
+            }
         }
         self.try_fire_route(&r, true, now_ms());
     }
@@ -1491,6 +1695,7 @@ impl Core {
             buy_ct,
             sell_ct,
             broker: self.broker.clone(),
+            router: self.router.clone(),
             watched: self.deps.watched.clone(),
             snapshot: self.deps.snapshot.clone(),
             events: self.event_tx.clone(),
@@ -1662,7 +1867,50 @@ impl Core {
     // ------------------------------------------------------------------
     // monitor: MTM, exits, hedging
     // ------------------------------------------------------------------
-    fn monitor(&mut self) {
+    /// Live-or-paper taker fill for the close path. In live mode with a
+    /// gateway on the venue this places a REAL order; otherwise the paper
+    /// broker fills instantly, exactly as before. (Free function taking
+    /// disjoint field borrows so the caller may hold `&mut positions`.)
+    async fn fill_or_paper(
+        router: &Arc<ArcSwap<VenueRouter>>,
+        broker: &PaperBroker,
+        venue: &str,
+        inst: &str,
+        side: paper::Side,
+        touch: f64,
+        depth: f64,
+        want_contracts: f64,
+        fee_rate: f64,
+        spot: f64,
+        ct: f64,
+    ) -> paper::Fill {
+        let r = router.load_full();
+        if r.live_armed() {
+            return r.take(venue, inst, side, touch, depth, want_contracts, fee_rate, spot, ct).await;
+        }
+        broker.take_sync(venue, side, touch, depth, want_contracts, fee_rate, spot, ct, 180)
+    }
+
+    /// Live-or-paper hedge. Returns (px, fee); px <= 0 means the live hedge
+    /// was REFUSED (no gateway on that venue) — the caller must skip the
+    /// hedge update rather than book a nonsense price.
+    async fn hedge_or_paper(
+        router: &Arc<ArcSwap<VenueRouter>>,
+        broker: &PaperBroker,
+        venue: &str,
+        und: &str,
+        side: paper::Side,
+        units: f64,
+        spot: f64,
+    ) -> (f64, f64) {
+        let r = router.load_full();
+        if r.live_armed() {
+            return r.hedge(venue, und, side, units, spot).await;
+        }
+        broker.hedge_sync(venue, side, units, spot)
+    }
+
+    async fn monitor(&mut self) {
         let now = now_ms();
         let watched = self.deps.watched.load();
         let snap = self.deps.snapshot.load();
@@ -1793,10 +2041,30 @@ impl Core {
             p.mtm.t_ms = now;
         }
 
-        // Apply hedges (sync fills — the paper broker's hedge_sync is instant).
+        // Apply hedges (live perp orders in live mode, instant paper fills
+        // otherwise). Data gathered without holding the positions borrow
+        // across the await.
         for (id, side, amt, spot) in hedges {
+            let Some((venue, und, opp_id)) = self.positions.get(&id).map(|p| {
+                (
+                    p.buy_venue.clone(),
+                    p.underlying.clone(),
+                    p.opp.clone(),
+                )
+            }) else {
+                continue;
+            };
+            let (px, _fee) = Self::hedge_or_paper(&self.router, &self.broker, &venue, &und, side, amt, spot).await;
+            if px <= 0.0 {
+                self.ev(
+                    Some(opp_id),
+                    ExecLevel::Error,
+                    "hedge",
+                    "live hedge refused (no perp gateway on venue) — delta stays unhedged".into(),
+                );
+                continue;
+            }
             if let Some(p) = self.positions.get_mut(&id) {
-                let (px, _fee) = self.broker.hedge_sync(&p.buy_venue, side, amt, spot);
                 let delta_units = if side == paper::Side::Buy { amt } else { -amt };
                 let new_units = p.hedge_units + delta_units;
                 p.hedge_avg_px = if new_units.abs() > 1e-9 {
@@ -1810,7 +2078,7 @@ impl Core {
         }
 
         for (id, reason) in to_close {
-            self.close_position(id, reason);
+            self.close_position(id, reason).await;
         }
 
         // Daily loss circuit breaker.
@@ -1838,7 +2106,7 @@ impl Core {
         self.dirty = true;
     }
 
-    fn close_position(&mut self, id: u64, reason: ExitReason) {
+    async fn close_position(&mut self, id: u64, reason: ExitReason) {
         let Some(mut p) = self.positions.remove(&id) else { return };
         let now = now_ms();
         let watched = self.deps.watched.load();
@@ -1881,12 +2149,13 @@ impl Core {
             .filter(|x| sane(*x, p.entry.buy_px_usd))
         {
             Some(bid) => {
-                let f = self.broker.take_sync(
-                    &p.buy_venue, paper::Side::Sell, bid,
+                let f = Self::fill_or_paper(
+                    &self.router, &self.broker,
+                    &p.buy_venue.clone(), &inst, paper::Side::Sell, bid,
                     buy_leg.and_then(|l| l.size_bid).unwrap_or(1.0),
                     p.units / p.contract_size_buy.max(1e-9), buy_fee, spot, p.contract_size_buy,
-                    180,
-                );
+                )
+                .await;
                 (f.px_unit, f.fee_usd)
             }
             _ => {
@@ -1915,12 +2184,13 @@ impl Core {
             .filter(|x| sane(*x, p.entry.sell_px_usd))
         {
             Some(ask) => {
-                let f = self.broker.take_sync(
-                    &p.sell_venue, paper::Side::Buy, ask,
+                let f = Self::fill_or_paper(
+                    &self.router, &self.broker,
+                    &p.sell_venue.clone(), &inst, paper::Side::Buy, ask,
                     sell_leg.and_then(|l| l.size_ask).unwrap_or(1.0),
                     p.units / p.contract_size_sell.max(1e-9), sell_fee, spot, p.contract_size_sell,
-                    180,
-                );
+                )
+                .await;
                 (f.px_unit, f.fee_usd)
             }
             _ => {
@@ -1943,8 +2213,16 @@ impl Core {
         let mut hedge_exit_pnl = 0.0;
         if p.hedge_units.abs() > 1e-9 {
             let side = if p.hedge_units > 0.0 { paper::Side::Sell } else { paper::Side::Buy };
-            let (px, _fee) = self.broker.hedge_sync(&p.buy_venue, side, p.hedge_units.abs(), spot);
-            hedge_exit_pnl = p.hedge_units * (px - p.hedge_avg_px);
+            let (px, _fee) = Self::hedge_or_paper(
+                &self.router, &self.broker,
+                &p.buy_venue.clone(), &p.underlying.clone(), side, p.hedge_units.abs(), spot,
+            )
+            .await;
+            if px > 0.0 {
+                hedge_exit_pnl = p.hedge_units * (px - p.hedge_avg_px);
+            } else {
+                hedge_exit_pnl = p.hedge_units * (spot - p.hedge_avg_px); // mark at spot when a live hedge was refused
+            }
             p.hedge_units = 0.0;
         }
 
@@ -2148,12 +2426,14 @@ impl Core {
     /// LiveStatus with the derived fields refreshed at publish time.
     fn live_status_now(&self) -> LiveStatus {
         let mut live = self.live.clone();
+        let router = self.router.load();
         live.live_gateways = self.live_gateways();
         live.route_ready = self.route_ready();
+        live.chain_signer = router.evm.signer_address();
         live.blockers = if matches!(self.mode, ExecMode::Live) {
             let mut b = Vec::new();
-            if !live.session_up {
-                b.push("deribit session not connected".into());
+            if live.live_gateways == 0 {
+                b.push("no venue gateways connected — set venue API keys (BYBIT/OKX/BINANCE/DERIBIT)".into());
             }
             if live.live_gateways < 2 {
                 b.push(format!(

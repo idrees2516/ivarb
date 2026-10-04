@@ -127,6 +127,8 @@ pub fn SidePanel() -> impl IntoView {
                 "⇧ FLATTEN ALL · TOP"
             </button>
 
+            <SpLiveCard st=st.clone() />
+
             <div class="sp-log">
                 <For each=move || events.get() key=|(t, s, m, _)| format!("{t}{s}{m}") let:ev>
                     {let (t, s, m, cls) = ev;
@@ -152,6 +154,171 @@ fn SpStat(label: &'static str, value: String, cls: &'static str) -> impl IntoVie
         <div class=format!("sp-stat {}", cls)>
             <span class="sp-l">{label}</span>
             <span class="sp-v">{value}</span>
+        </div>
+    }
+}
+
+/// Live connectivity + instant on-chain swap card.
+///
+/// One compact surface for "is this real?": per-venue gateway chips
+/// (LIVE when credentials + gateway are up), per-chain chips with the LIVE
+/// on-chain ETH price from Uniswap quotes, a preflight button, and the
+/// CHAIN SWAP form — quotes the real QuoterV2 and, when a signer key is
+/// configured, broadcasts a real EIP-1559 transaction.
+#[component]
+fn SpLiveCard(st: ApiState) -> impl IntoView {
+    let exec = Memo::new(move |_| st.exec.get());
+    let live = Memo::new(move |_| exec.get().map(|e| e.live.clone()).unwrap_or_default());
+
+    let chain_pick = RwSignal::new("base".to_string());
+    let weth_in = RwSignal::new(true);
+    let amount = RwSignal::new("0.01".to_string());
+
+    let st_pf = st.clone();
+    let st_sw = st.clone();
+    let st_rf = st.clone();
+
+    view! {
+        <div class="sp-live">
+            <div class="sp-live-head">
+                <span class="sp-live-title">"LIVE CONNECTIVITY"</span>
+                <button class="sp-mini-btn" title="check venue credentials + gateways + on-chain RPC (never orders)"
+                    on:click=move |_| st_pf.send_exec_cmd(ExecCommand::LivePreflight, "preflight running — see event log".into())>
+                    "PREFLIGHT"
+                </button>
+            </div>
+
+            <div class="sp-chips">
+                {move || {
+                    let l = live.get();
+                    let venues: Vec<_> = l
+                        .venues
+                        .iter()
+                        .map(|v| {
+                            let cls = if v.healthy {
+                                "chip live"
+                            } else if v.creds {
+                                "chip warn"
+                            } else {
+                                "chip off"
+                            };
+                            let title = v.detail.clone();
+                            (v.venue.clone(), cls.to_string(), title)
+                        })
+                        .collect();
+                    if venues.is_empty() {
+                        vec![("deribit · bybit · okx · binance".into(), "chip off".into(), "run PREFLIGHT to detect venue credentials".into())]
+                    } else {
+                        venues
+                    }
+                    .into_iter()
+                    .map(|(name, cls, title)| {
+                        view! {
+                            <span class=cls class:chip-dim=title.is_empty() title=title.clone()>
+                                {name.clone()}
+                            </span>
+                        }
+                        .into_any()
+                    })
+                    .collect::<Vec<_>>()
+                }}
+            </div>
+
+            <div class="sp-chips">
+                {move || {
+                    let l = live.get();
+                    if l.chains.is_empty() {
+                        vec![view! {
+                            <span class="chip off" title="on-chain status not yet probed">"chains: probing…"</span>
+                        }.into_any()]
+                    } else {
+                        l.chains
+                            .iter()
+                            .map(|c| {
+                                let cls = if c.ok { "chip live" } else { "chip warn" };
+                                let title = format!(
+                                    "block {} · {:.2} gwei · rpc {} ms · 0.01 WETH → {:.2} USDC (live Uniswap V3 quote)",
+                                    c.block, c.gas_gwei, c.rpc_ms, c.weth_usdc_out
+                                );
+                                view! {
+                                    <span class=cls title=title>
+                                        {format!("{} ${:.0}", c.name, c.eth_price)}
+                                    </span>
+                                }
+                                .into_any()
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                }}
+            </div>
+
+            <div class="sp-swap">
+                <div class="sp-swap-row">
+                    <select class="sp-select" prop:value=move || chain_pick.get()
+                        on:change=move |ev| {
+                            let v = event_target_value(&ev);
+                            chain_pick.set(v);
+                        }>
+                        <option value="base">"base"</option>
+                        <option value="arbitrum">"arbitrum"</option>
+                        <option value="optimism">"optimism"</option>
+                        <option value="ethereum">"ethereum"</option>
+                    </select>
+                    <div class="sp-dir">
+                        <button class=move || format!("sp-dir-btn {}", if weth_in.get() { "on" } else { "" })
+                            on:click=move |_| weth_in.set(true)>"ETH→USDC"</button>
+                        <button class=move || format!("sp-dir-btn {}", if !weth_in.get() { "on" } else { "" })
+                            on:click=move |_| weth_in.set(false)>"USDC→ETH"</button>
+                    </div>
+                </div>
+                <div class="sp-swap-row">
+                    <input class="sp-input" type="text" inputmode="decimal"
+                        prop:value=move || amount.get()
+                        on:input=move |ev| amount.set(event_target_value(&ev))
+                        placeholder="amount" />
+                    <button class="sp-swap-btn" title="quote the real on-chain Uniswap V3 pool and execute (broadcasts when a signer key is configured)"
+                        on:click=move |_| {
+                            let amt: f64 = amount.get().trim().parse().unwrap_or(0.0);
+                            if amt <= 0.0 {
+                                st.send_exec_cmd(ExecCommand::ChainStatusRefresh, "enter a positive amount first".into());
+                                return;
+                            }
+                            st_sw.send_exec_cmd(
+                                ExecCommand::ChainSwap {
+                                    chain: chain_pick.get(),
+                                    weth_in: weth_in.get(),
+                                    amount: amt,
+                                },
+                                format!("swap sent to {} — quoting live…", chain_pick.get()),
+                            );
+                        }>
+                        "EXECUTE"
+                    </button>
+                </div>
+                {move || {
+                    let l = live.get();
+                    l.swaps.iter().rev().take(3)
+                        .map(|s| {
+                            let line = match (&s.tx_hash, s.broadcast) {
+                                (Some(h), true) => format!("{} {} {:.6} → {:.4} · tx {}…", s.chain, s.direction, s.amount_in, s.quoted_out, &h[..h.len().min(10)]),
+                                _ => format!("{} {} {:.6} → quoted {:.4} · payload ready (no signer)", s.chain, s.direction, s.amount_in, s.quoted_out),
+                            };
+                            view! { <div class="sp-swap-line" title=s.calldata_hex.clone()>{line}</div> }.into_any()
+                        })
+                        .collect::<Vec<_>>()
+                }}
+                {move || {
+                    let l = live.get();
+                    l.chain_signer.as_ref().map(|a| {
+                        view! { <div class="sp-signer" title="IVARB_CHAIN_SIGNER_KEY is set — swaps broadcast REAL transactions from this address">{
+                            format!("signer {}… (real broadcast)", &a[..a.len().min(10)])
+                        }</div> }.into_any()
+                    })
+                }}
+                <button class="sp-mini-btn wide" on:click=move |_| st_rf.send_exec_cmd(ExecCommand::ChainStatusRefresh, "chain status refreshing…".into())>
+                    "REFRESH CHAINS"
+                </button>
+            </div>
         </div>
     }
 }

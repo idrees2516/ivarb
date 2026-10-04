@@ -1435,3 +1435,28 @@ code {
   .sp-panel { width: min(300px, 88vw); }
   .sp-toggle { top: 30%; }
 }
+
+/* ---- side panel: live connectivity + chain swap ---- */
+.sp-live { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 9px; display: flex; flex-direction: column; gap: 7px; }
+.sp-live-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.sp-live-title { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; color: var(--text-faint); }
+.sp-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { font-family: var(--mono); font-size: 10.5px; padding: 3px 7px; border-radius: 999px; border: 1px solid var(--border-2); color: var(--text-dim); white-space: nowrap; cursor: default; }
+.chip.live { color: var(--green); border-color: rgba(52,211,153,0.45); background: rgba(52,211,153,0.08); }
+.chip.warn { color: var(--amber); border-color: rgba(251,191,36,0.4); background: rgba(251,191,36,0.07); }
+.chip.off { color: var(--text-faint); }
+.sp-mini-btn { background: transparent; color: var(--cyan); border: 1px solid rgba(56,189,248,0.35); border-radius: 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; padding: 4px 8px; cursor: pointer; }
+.sp-mini-btn:hover { background: rgba(56,189,248,0.1); }
+.sp-mini-btn.wide { width: 100%; }
+.sp-swap { display: flex; flex-direction: column; gap: 6px; }
+.sp-swap-row { display: flex; gap: 6px; align-items: stretch; }
+.sp-select { flex: 0 0 92px; background: var(--panel); color: var(--text); border: 1px solid var(--border-2); border-radius: 6px; font-family: var(--mono); font-size: 11.5px; padding: 6px; }
+.sp-dir { display: flex; flex: 1; gap: 4px; }
+.sp-dir-btn { flex: 1; background: transparent; border: 1px solid var(--border-2); border-radius: 6px; color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; padding: 5px 2px; cursor: pointer; }
+.sp-dir-btn.on { color: var(--cyan); border-color: rgba(56,189,248,0.5); background: rgba(56,189,248,0.08); }
+.sp-input { flex: 1; min-width: 0; background: var(--panel); color: var(--text); border: 1px solid var(--border-2); border-radius: 6px; font-family: var(--mono); font-size: 11.5px; padding: 6px 8px; }
+.sp-input:focus { outline: none; border-color: var(--cyan); }
+.sp-swap-btn { background: var(--cyan); color: #041018; border: none; border-radius: 6px; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; padding: 6px 12px; cursor: pointer; }
+.sp-swap-btn:hover { filter: brightness(1.1); }
+.sp-swap-line { font-family: var(--mono); font-size: 10px; color: var(--text-dim); word-break: break-all; line-height: 1.5; }
+.sp-signer { font-family: var(--mono); font-size: 10px; color: var(--amber); word-break: break-all; }

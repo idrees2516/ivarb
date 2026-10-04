@@ -37,6 +37,7 @@ use ivarb_protocol::{
     ExecEvent, ExecLevel, ExecSettings, MultiHopLeg, MultiHopRoute, Snapshot, TradeLeg, WatchedLeg,
 };
 
+use crate::gateways::VenueRouter;
 use crate::now_ms;
 use crate::paper::{Fill, PaperBroker, Side};
 
@@ -47,6 +48,8 @@ pub struct RouteCtx {
     pub spot: f64,
     pub settings: ExecSettings,
     pub broker: Arc<PaperBroker>,
+    /// Paper-vs-live dispatch per venue leg (real gateways when armed).
+    pub router: Arc<ArcSwap<VenueRouter>>,
     pub watched: Arc<ArcSwap<FxHashMap<String, Vec<WatchedLeg>>>>,
     pub snapshot: Arc<ArcSwap<Snapshot>>,
     pub events: tokio::sync::mpsc::UnboundedSender<ExecEvent>,
@@ -303,15 +306,18 @@ fn premium_cap(ctx: &RouteCtx, inst: &str) -> f64 {
 async fn take_leg(
     ctx: &RouteCtx,
     venue: &str,
+    instrument: &str,
     side: Side,
     touch: f64,
     depth_units: f64,
     contracts: f64,
     ct: f64,
 ) -> Fill {
-    ctx.broker
+    let router = ctx.router.load_full();
+    router
         .take(
             venue,
+            instrument,
             side,
             touch,
             (depth_units / ct.max(1e-9)).max(contracts.min(1.0)),
@@ -346,7 +352,7 @@ async fn exec_leg(ctx: &RouteCtx, st: &mut ExecState, leg: &MultiHopLeg, k: usiz
                 return Err(format!("dust ask on {} ({:.0} vs print {:.0})", leg.venue, touch, leg.px_unit));
             }
             let want = st.units / ct;
-            let f = take_leg(ctx, &leg.venue, Side::Buy, touch, depth, want, ct).await;
+            let f = take_leg(ctx, &leg.venue, &leg.instrument, Side::Buy, touch, depth, want, ct).await;
             if f.contracts <= 0.0 {
                 return Err("no fill at the ask".into());
             }
@@ -362,7 +368,7 @@ async fn exec_leg(ctx: &RouteCtx, st: &mut ExecState, leg: &MultiHopLeg, k: usiz
                 return Err(format!("dust bid on {} ({:.0} vs print {:.0})", leg.venue, touch, leg.px_unit));
             }
             let want = st.units / ct;
-            let f = take_leg(ctx, &leg.venue, Side::Sell, touch, depth, want, ct).await;
+            let f = take_leg(ctx, &leg.venue, &leg.instrument, Side::Sell, touch, depth, want, ct).await;
             if f.contracts <= 0.0 {
                 return Err("no fill at the bid".into());
             }
@@ -410,15 +416,15 @@ async fn exec_leg(ctx: &RouteCtx, st: &mut ExecState, leg: &MultiHopLeg, k: usiz
             }
 
             let want = st.units / ct;
-            let f_src = take_leg(ctx, &leg.venue, Side::Sell, sb, sd, want, src_ct).await;
+            let f_src = take_leg(ctx, &leg.venue, &src_inst, Side::Sell, sb, sd, want, src_ct).await;
             if f_src.contracts <= 0.0 {
                 return Err("conversion source sell missed".into());
             }
-            let f_tgt = take_leg(ctx, &leg.venue, Side::Buy, ta, td, want, ct).await;
+            let f_tgt = take_leg(ctx, &leg.venue, &leg.instrument, Side::Buy, ta, td, want, ct).await;
             if f_tgt.contracts <= 0.0 {
                 // Source sold but target not bought: buy the source back —
                 // the conversion simply did not happen.
-                let undo = take_leg(ctx, &leg.venue, Side::Buy, sb * 1.01, sd, f_src.contracts, src_ct).await;
+                let undo = take_leg(ctx, &leg.venue, &src_inst, Side::Buy, sb * 1.01, sd, f_src.contracts, src_ct).await;
                 st.cash += undo.contracts * src_ct * (sb - undo.px_unit) - undo.fee_usd;
                 st.fees += undo.fee_usd;
                 return Err("conversion target buy missed (source restored)".into());
@@ -426,7 +432,7 @@ async fn exec_leg(ctx: &RouteCtx, st: &mut ExecState, leg: &MultiHopLeg, k: usiz
             let done_units = (f_src.contracts * src_ct).min(f_tgt.contracts * ct);
             // Perp hedge: selling the call and buying the put shifts delta
             // by −1 per unit (parity) — sell perp to stay flat through the hop.
-            let (hpx, hfee) = ctx.broker.hedge_sync(&leg.venue, Side::Sell, done_units, ctx.spot);
+            let (hpx, hfee) = ctx.router.load_full().hedge(&leg.venue, &ctx.route.underlying, Side::Sell, done_units, ctx.spot).await;
             st.hedge.trade(Side::Sell, done_units, hpx);
             st.cash += -hfee;
             st.fees += hfee;
@@ -615,7 +621,7 @@ async fn settle(ctx: &RouteCtx, st: &mut ExecState) {
             (Side::Buy, a, d)
         };
         let contracts = net.abs() / ct;
-        let f = take_leg(ctx, venue, side, touch, depth, contracts, ct).await;
+        let f = take_leg(ctx, venue, &inst, side, touch, depth, contracts, ct).await;
         if f.contracts > 0.0 {
             let units = f.contracts * ct;
             let sign = if side == Side::Sell { 1.0 } else { -1.0 };
@@ -651,7 +657,11 @@ async fn settle(ctx: &RouteCtx, st: &mut ExecState) {
             .map(|l| l.venue.clone())
             .unwrap_or_else(|| ctx.route.legs[0].venue.clone());
         let side = if st.hedge.units > 0.0 { Side::Sell } else { Side::Buy };
-        let (px, fee) = ctx.broker.hedge_sync(&venue, side, st.hedge.units.abs(), ctx.spot);
+        let (px, fee) = ctx
+            .router
+            .load_full()
+            .hedge(&venue, &ctx.route.underlying, side, st.hedge.units.abs(), ctx.spot)
+            .await;
         st.hedge.trade(side, st.hedge.units.abs(), px);
         st.cash -= fee;
         st.fees += fee;
@@ -679,7 +689,7 @@ async fn unwind_all(ctx: &RouteCtx, st: &mut ExecState, reason: &str) -> RouteOu
                     .and_then(|q| q.px_bid_unit.zip(q.size_bid))
                     .filter(|(p, s)| *p > 0.0 && *s > 0.0)
                     .unwrap_or((leg.px_unit * 0.99, leg.units()));
-                let f = take_leg(ctx, &leg.venue, Side::Sell, touch, depth, leg.contracts, ct).await;
+                let f = take_leg(ctx, &leg.venue, &leg.instrument, Side::Sell, touch, depth, leg.contracts, ct).await;
                 if f.contracts > 0.0 {
                     st.cash += f.contracts * ct * f.px_unit - f.fee_usd;
                     st.fees += f.fee_usd;
@@ -691,7 +701,7 @@ async fn unwind_all(ctx: &RouteCtx, st: &mut ExecState, reason: &str) -> RouteOu
                     .and_then(|q| q.px_ask_unit.zip(q.size_ask))
                     .filter(|(p, s)| *p > 0.0 && *s > 0.0)
                     .unwrap_or((leg.px_unit * 1.01, leg.units()));
-                let f = take_leg(ctx, &leg.venue, Side::Buy, touch, depth, leg.contracts, ct).await;
+                let f = take_leg(ctx, &leg.venue, &leg.instrument, Side::Buy, touch, depth, leg.contracts, ct).await;
                 if f.contracts > 0.0 {
                     st.cash -= f.contracts * ct * f.px_unit + f.fee_usd;
                     st.fees += f.fee_usd;
@@ -711,8 +721,8 @@ async fn unwind_all(ctx: &RouteCtx, st: &mut ExecState, reason: &str) -> RouteOu
                     .and_then(|q| q.px_ask_unit.zip(q.size_ask))
                     .filter(|(p, s)| *p > 0.0 && *s > 0.0)
                     .unwrap_or((1.0, leg.units()));
-                let f_tgt = take_leg(ctx, &leg.venue, Side::Sell, tb, td, leg.contracts, ct).await;
-                let f_src = take_leg(ctx, &leg.venue, Side::Buy, sa, sd, leg.contracts, sct).await;
+                let f_tgt = take_leg(ctx, &leg.venue, &leg.instrument, Side::Sell, tb, td, leg.contracts, ct).await;
+                let f_src = take_leg(ctx, &leg.venue, &src_inst, Side::Buy, sa, sd, leg.contracts, sct).await;
                 if f_tgt.contracts > 0.0 && f_src.contracts > 0.0 {
                     let u = (f_tgt.contracts * ct).min(f_src.contracts * sct);
                     let fee = f_tgt.fee_usd + f_src.fee_usd;
@@ -720,7 +730,7 @@ async fn unwind_all(ctx: &RouteCtx, st: &mut ExecState, reason: &str) -> RouteOu
                     st.fees += fee;
                     *st.inv.entry((leg.venue.clone(), right_of(&src_inst))).or_insert(0.0) += f_src.contracts * sct;
                     *st.inv.entry((leg.venue.clone(), right_of(&leg.instrument))).or_insert(0.0) -= f_tgt.contracts * ct;
-                    let (hpx, hfee) = ctx.broker.hedge_sync(&leg.venue, Side::Buy, u, ctx.spot);
+                    let (hpx, hfee) = ctx.router.load_full().hedge(&leg.venue, &ctx.route.underlying, Side::Buy, u, ctx.spot).await;
                     st.hedge.trade(Side::Buy, u, hpx);
                     st.cash -= hfee;
                     st.fees += hfee;
@@ -940,6 +950,10 @@ mod tests {
         fee_rates.insert("okx".to_string(), 0.0003);
         fee_rates.insert("bybit".to_string(), 0.0003);
         fee_rates.insert("deribit".to_string(), 0.0003);
+        let router = Arc::new(ArcSwap::from_pointee(crate::gateways::VenueRouter::new(
+            broker.clone(),
+            false, // tests run the paper path
+        )));
         (
             RouteCtx {
                 attempt: 1,
@@ -947,6 +961,7 @@ mod tests {
                 spot: 84_000.0,
                 settings: ExecSettings::default(),
                 broker: broker.clone(),
+                router,
                 watched,
                 snapshot: snap,
                 events: tx,

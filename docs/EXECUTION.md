@@ -234,13 +234,25 @@ rule, unwinds, hedging, exits) runs end-to-end without keys:
   refused), lifetime deposit tracking; equity and P&L are measured
   against *net deposits* so funding never inflates performance.
 
-## The Deribit live path (`live.rs`)
+## The live paths (`live.rs`, `gateways/`)
 
-- **Triple environment gate**: live mode requires `IVARB_MODE=live` *and*
+The original Deribit scaffold grew into a multi-venue + on-chain execution
+layer — see **[docs/LIVE-TRADING.md](LIVE-TRADING.md)** for the complete
+guide. Summary of what executes for real:
+
+- **Deribit** (WS, triple-gated): **Triple environment gate**: live mode requires `IVARB_MODE=live` *and*
   `DERIBIT_API_KEY`/`DERIBIT_API_SECRET` *and* `IVARB_LIVE_CONFIRM=yes`.
   Any missing piece keeps the system in paper mode with the blockers
   published to the UI. `DERIBIT_WS_URL=wss://test.deribit.com/ws/api/v2`
   rehearses on testnet.
+- **Bybit V5 / OKX v5 / Binance eapi** (REST + HMAC): options market/IOC
+  orders with per-venue fill polling; Bybit + OKX also hedge live through
+  their USDT perps. A live leg on an ungated venue refuses (zero fill) —
+  never simulated.
+- **Chains** (Base/Arbitrum/Optimism/Ethereum): real Uniswap V3 quotes via
+  QuoterV2 `eth_call`; with `IVARB_CHAIN_SIGNER_KEY` the side panel's
+  CHAIN SWAP broadcasts real EIP-1559 approve+swap transactions through
+  SwapRouter02.
 - **`ivarb-server --live-preflight`** validates the full chain (gates,
   credentials, account) and exits — a zero-risk key check.
 - **Order discipline**: private `buy`/`sell` IOC only; decimal snapping
