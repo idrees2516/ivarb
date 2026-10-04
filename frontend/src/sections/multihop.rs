@@ -6,30 +6,46 @@
 //! call↔put parity conversions hedged with a perp — so a divergence can be
 //! monetized even when the direct side of the book is one-sided or missing.
 //! Found by negative-cycle search over log-priced edges, re-scanned every
-//! 250 ms on touched strike families.
+//! 250 ms on touched strike families, ranked by EXPECTED profit (print ×
+//! data-confidence quality), and executed leg-by-leg by the route sequencer
+//! (hardest-first ordering, generalized 10-second rule, mid-flight
+//! abandonment, partial-fill settlement).
 
 use leptos::prelude::*;
 
 use crate::fmt;
 use crate::state::ApiState;
-use ivarb_protocol::MultiHopRoute;
+use ivarb_protocol::{ExecCommand, MultiHopRoute};
 
 #[component]
 pub fn MultihopSection() -> impl IntoView {
     let st = use_context::<ApiState>().unwrap();
     let routes = Memo::new(move |_| {
         let mut v = st.multihop.get();
-        v.sort_by(|a, b| b.total_usd.total_cmp(&a.total_usd));
+        v.sort_by(|a, b| (b.total_usd * b.quality).total_cmp(&(a.total_usd * a.quality)));
         v.truncate(12);
         v
     });
     let now = st.now;
+    let taker_state = Memo::new(move |_| st.exec.get());
+    let live_routes = Memo::new(move |_| {
+        taker_state
+            .get()
+            .map(|e| e.stats.route_attempts_active)
+            .unwrap_or(0)
+    });
+    let routes_on = Memo::new(move |_| {
+        taker_state
+            .get()
+            .map(|e| e.settings.routes_enabled)
+            .unwrap_or(false)
+    });
 
     view! {
         <section class="section" id="multihop">
             <crate::app::SectionHead num="05"
                 title="Multi-hop routes — negative-cycle arbitrage across venues and rights"
-                sub="Every hop is executable: buy an option at an ask, sell at a bid, or convert call↔put on the same venue via put-call parity with a perp hedge. A cycle whose cash flow is positive after every fee is free money — the engine searches all touched strike families for them every 250 ms."/>
+                sub="Every hop is executable: buy an option at an ask, sell at a bid, or convert call↔put on the same venue via put-call parity with a perp hedge. A cycle whose cash flow is positive after every fee is free money — the engine searches all touched strike families for them every 250 ms and the taker fires the ones whose EXPECTED profit (print × data quality) clears the bar."/>
             <div class="hold-intro">
                 <p>
                     "Why hops matter: thin venues often publish one-sided books — an ask on the call but no bid, while "
@@ -38,6 +54,21 @@ pub fn MultihopSection() -> impl IntoView {
                     "monetizes a divergence the direct scanner has to skip. Conversion legs carry the perp hedge fees "
                     "and a basis buffer, so they must clear a higher bar than a direct two-leg arb."
                 </p>
+                <div class="mh-status">
+                    {move || if routes_on.get() {
+                        view! {
+                            <span class="mh-autochip on">
+                                {format!("◈ auto-taking live — {} cycle(s) executing", live_routes.get())}
+                            </span>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <span class="mh-autochip off">
+                                "◈ auto-taking off — enable ROUTES in the Advantage taker"
+                            </span>
+                        }.into_any()
+                    }}
+                </div>
             </div>
             {move || {
                 let rs = routes.get();
@@ -65,6 +96,11 @@ pub fn MultihopSection() -> impl IntoView {
 
 #[component]
 fn RouteCard(r: MultiHopRoute, now: i64) -> impl IntoView {
+    let st = use_context::<ApiState>().unwrap();
+    let expected = r.total_usd * r.quality;
+    let id_take = r.id.clone();
+    let n_legs = r.legs.len();
+    let exp_txt = fmt::fmt_usd(expected);
     view! {
         <div class="mh-card">
             <div class="mh-head">
@@ -72,6 +108,9 @@ fn RouteCard(r: MultiHopRoute, now: i64) -> impl IntoView {
                     <span class="i-und">{r.underlying.clone()}</span>
                     <span class="i-date">{r.expiry.clone()}</span>
                     <span class="i-strike">{fmt::fmt_strike(r.strike)}{" strike"}</span>
+                    <span class=move || format!("mh-quality {}", if r.quality >= 0.6 { "hi" } else if r.quality >= 0.3 { "mid" } else { "lo" })>
+                        {format!("quality {:.0}%", 100.0 * r.quality)}
+                    </span>
                 </div>
                 <div class="mh-profits">
                     <span class="mh-profit">{fmt::fmt_usd(r.profit_unit_usd)}</span>
@@ -104,7 +143,16 @@ fn RouteCard(r: MultiHopRoute, now: i64) -> impl IntoView {
                 </For>
             </div>
             <div class="mh-foot">
-                <span class="dim">{format!("quotes {} old · fees buffered per leg", fmt::fmt_age(r.max_age_ms))}</span>
+                <span class="mh-exp">
+                    {format!("expected {} (print × quality) · quotes {} old", fmt::fmt_usd(expected), fmt::fmt_age(r.max_age_ms))}
+                </span>
+                <button class="mh-take"
+                    on:click=move |_| st.send_exec_cmd(
+                        ExecCommand::TakeRoute { route: id_take.clone() },
+                        format!("route take sent — {n_legs} legs, expected {exp_txt}"),
+                    )>
+                    {format!("TAKE THIS ROUTE · {}", exp_txt)}
+                </button>
                 <span class="dim">{format!("updated {} ago", fmt::fmt_age(now - r.updated_ms))}</span>
             </div>
         </div>

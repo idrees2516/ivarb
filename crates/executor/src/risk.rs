@@ -89,6 +89,9 @@ impl RiskState {
         let tier_on = match opp.tier {
             ivarb_protocol::Tier::Sniper => settings.sniper_enabled,
             ivarb_protocol::Tier::Convergence => settings.convergence_enabled,
+            // Route-tier opportunities are multi-hop cycles — they fire
+            // through the route sequencer, never the two-leg FSMs.
+            ivarb_protocol::Tier::Route => settings.routes_enabled,
             ivarb_protocol::Tier::Monitor => false,
         };
         if !tier_on {

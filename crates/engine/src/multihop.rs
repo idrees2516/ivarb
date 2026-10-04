@@ -107,6 +107,18 @@ pub fn scan_family(
         return Vec::new();
     }
     let n_venues = live.len();
+    // ---- theoretical premium bounds (no-arbitrage, hard) -------------------
+    // A call can never be worth more than the underlying; a put never more
+    // than the strike. Any quote outside these bounds is a venue-unit
+    // artifact (wrong contract-size divisor, stale dust, decimal shift) —
+    // exactly the class of data bug that fabricates million-dollar phantom
+    // routes. 5% headroom absorbs spot drift between quote and check.
+    let strike = key.strike();
+    let call_cap = spot * 1.05;
+    let put_cap = strike * 1.05;
+    let sane_call = |p: f64| p > 0.0 && p <= call_cap;
+    let sane_put = |p: f64| p > 0.0 && p <= put_cap;
+
     // ---- build the leg-template set -----------------------------------------
     // Each template is one executable trade; `cost` is the net cash outflow
     // per underlying unit (negative = receive). The search below walks an
@@ -137,12 +149,12 @@ pub fn scan_family(
     for (vi, q) in live.iter().enumerate() {
         // Buy / sell the CALL on this venue.
         if let Some(c) = q.call {
-            if let Some(ask) = c.px_ask_unit.filter(|p| *p > 0.0) {
+            if let Some(ask) = c.px_ask_unit.filter(|p| sane_call(*p)) {
                 let fee = opt_fee(q.fee_rate);
                 let sz = c.size_ask.unwrap_or(0.0).min(min_size_units).max(0.0);
                 push(&mut legs, "buy", vi, 0, ask, fee, sz, ask + fee);
             }
-            if let Some(bid) = c.px_bid_unit.filter(|p| *p > 0.0) {
+            if let Some(bid) = c.px_bid_unit.filter(|p| sane_call(*p)) {
                 let fee = opt_fee(q.fee_rate);
                 let sz = c.size_bid.unwrap_or(0.0).min(min_size_units).max(0.0);
                 push(&mut legs, "sell", vi, 0, bid, fee, sz, -(bid - fee));
@@ -150,12 +162,12 @@ pub fn scan_family(
         }
         // Buy / sell the PUT on this venue.
         if let Some(p) = q.put {
-            if let Some(ask) = p.px_ask_unit.filter(|p| *p > 0.0) {
+            if let Some(ask) = p.px_ask_unit.filter(|p| sane_put(*p)) {
                 let fee = opt_fee(q.fee_rate);
                 let sz = p.size_ask.unwrap_or(0.0).min(min_size_units).max(0.0);
                 push(&mut legs, "buy", vi, 1, ask, fee, sz, ask + fee);
             }
-            if let Some(bid) = p.px_bid_unit.filter(|p| *p > 0.0) {
+            if let Some(bid) = p.px_bid_unit.filter(|p| sane_put(*p)) {
                 let fee = opt_fee(q.fee_rate);
                 let sz = p.size_bid.unwrap_or(0.0).min(min_size_units).max(0.0);
                 push(&mut legs, "sell", vi, 1, bid, fee, sz, -(bid - fee));
@@ -169,16 +181,16 @@ pub fn scan_family(
             let extra = params.conversion_cost_unit;
             // Long call -> long put: sell call at bid, buy put at ask.
             if let (Some(cb), Some(pa)) = (
-                c.px_bid_unit.filter(|x| *x > 0.0),
-                p.px_ask_unit.filter(|x| *x > 0.0),
+                c.px_bid_unit.filter(|x| sane_call(*x)),
+                p.px_ask_unit.filter(|x| sane_put(*x)),
             ) {
                 let sz = c.size_bid.unwrap_or(0.0).min(p.size_ask.unwrap_or(0.0)).min(min_size_units).max(0.0);
                 push(&mut legs, "convert", vi, 1, pa - cb, hedge_fee + extra, sz, pa - cb + hedge_fee + extra);
             }
             // Long put -> long call: sell put at bid, buy call at ask.
             if let (Some(pb), Some(ca)) = (
-                p.px_bid_unit.filter(|x| *x > 0.0),
-                c.px_ask_unit.filter(|x| *x > 0.0),
+                p.px_bid_unit.filter(|x| sane_put(*x)),
+                c.px_ask_unit.filter(|x| sane_call(*x)),
             ) {
                 let sz = p.size_bid.unwrap_or(0.0).min(c.size_ask.unwrap_or(0.0)).min(min_size_units).max(0.0);
                 push(&mut legs, "convert", vi, 0, ca - pb, hedge_fee + extra, sz, ca - pb + hedge_fee + extra);
@@ -210,25 +222,66 @@ pub fn scan_family(
         return Vec::new();
     }
 
-    // Rank and dedupe by leg signature.
-    found_routes.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // ---- score, rank and dedupe by leg signature ----------------------------
+    // Sophistication: routes are ranked by EXPECTED profit — raw profit × a
+    // data-confidence `quality` factor built from quote freshness, executable
+    // depth and two-sidedness. A fat printed edge resting on stale, thin or
+    // one-sided books is exactly the route that aborts at fire time; the
+    // expectation is what the taker should chase first.
+    let mut scored: Vec<(f64, f64, Vec<usize>)> = found_routes
+        .into_iter()
+        .map(|(profit, leg_idx)| {
+            let mut size = f64::INFINITY;
+            let mut depth_conf = 1.0f64;
+            let mut two_sided = 1.0f64;
+            let mut max_age: i64 = 0;
+            for &li in &leg_idx {
+                let t = &legs[li];
+                if t.size_units < size {
+                    size = t.size_units;
+                }
+                if min_size_units > 1e-9 {
+                    depth_conf = depth_conf.min((t.size_units / min_size_units).clamp(0.0, 1.0));
+                }
+                let q = live[t.venue_idx];
+                let lq = if t.right == 0 { q.call } else { q.put };
+                if let Some(lq) = lq {
+                    max_age = max_age.max(now_ms - lq.recv_ms);
+                    let both = lq.px_bid_unit.filter(|x| *x > 0.0).is_some()
+                        && lq.px_ask_unit.filter(|x| *x > 0.0).is_some();
+                    if !both {
+                        two_sided *= 0.7;
+                    }
+                }
+            }
+            if !size.is_finite() {
+                size = 0.0;
+            }
+            let freshness = (1.0 - (max_age.max(0) as f64 / stale_ms.max(1) as f64).clamp(0.0, 1.0)).sqrt();
+            let quality = (freshness * depth_conf * two_sided).clamp(0.05, 1.0);
+            (profit * size * quality, profit, leg_idx)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
     let mut seen_sigs: Vec<Vec<usize>> = Vec::new();
     let mut routes: Vec<MultiHopRoute> = Vec::new();
     let expiry = iso_from_ymd(key.date);
     let strike = key.strike();
 
-    for (profit, leg_idx) in found_routes {
+    for (_, profit, leg_idx) in scored {
         if routes.len() >= MAX_ROUTES_PER_FAMILY {
             break;
         }
-        let sig: Vec<usize> = leg_idx.clone();
-        if seen_sigs.contains(&sig) {
+        if seen_sigs.contains(&leg_idx) {
             continue;
         }
-        seen_sigs.push(sig);
+        seen_sigs.push(leg_idx.clone());
 
         let mut max_age: i64 = 0;
         let mut size = f64::INFINITY;
+        let mut depth_conf = 1.0f64;
+        let mut two_sided = 1.0f64;
         let mut wire_legs: Vec<MultiHopLeg> = Vec::with_capacity(leg_idx.len());
         let mut chain: Vec<String> = Vec::with_capacity(leg_idx.len());
         for &li in &leg_idx {
@@ -237,9 +290,17 @@ pub fn scan_family(
             let lq = if t.right == 0 { q.call } else { q.put };
             if let Some(lq) = lq {
                 max_age = max_age.max(now_ms - lq.recv_ms);
+                let both = lq.px_bid_unit.filter(|x| *x > 0.0).is_some()
+                    && lq.px_ask_unit.filter(|x| *x > 0.0).is_some();
+                if !both {
+                    two_sided *= 0.7;
+                }
             }
             if t.size_units < size {
                 size = t.size_units;
+            }
+            if min_size_units > 1e-9 {
+                depth_conf = depth_conf.min((t.size_units / min_size_units).clamp(0.0, 1.0));
             }
             let right_ch = if t.right == 0 { "C" } else { "P" };
             let inst = format!(
@@ -260,8 +321,17 @@ pub fn scan_family(
             chain.push(format!("{} {}", t.action, q.venue));
         }
         if !size.is_finite() || size <= 0.0 {
-            size = 0.0;
+            // A route whose legs publish no executable size (deribit REST
+            // summaries carry no touch sizes, for one) cannot fire — the
+            // sequencer requires depth on every leg. Dead rows at $0 total
+            // would only flatter the route count; skip them.
+            continue;
         }
+        // Freshness: quotes at the staleness boundary contribute ~0, fresh
+        // ticks ~1. The executor re-validates every leg at fire time anyway;
+        // this factor only steers WHICH route fires first.
+        let freshness = (1.0 - (max_age.max(0) as f64 / stale_ms.max(1) as f64).clamp(0.0, 1.0)).sqrt();
+        let quality = (freshness * depth_conf * two_sided).clamp(0.05, 1.0);
         // Vol-point view on the family vega (approximate: use 50 % IV ref).
         let t = crate::key::t_years(now_ms, crate::key::ymd_to_expiry_ms(key.date).unwrap_or(now_ms));
         let vega = ivarb_quant::vega_per_vp_unit(spot, strike, t, 0.5);
@@ -282,6 +352,7 @@ pub fn scan_family(
             profit_vp,
             size_units: size,
             total_usd: profit * size,
+            quality,
             max_age_ms: max_age.max(0),
             updated_ms: now_ms,
         });
@@ -520,6 +591,37 @@ mod tests {
         let key = InstKey { und: 0, date: 20261230, strike_ticks: 84_000_000, right: RIGHT_CALL };
         let routes = scan_family(&key, &fams, 84_000.0, 2_000, 45_000, &MultihopParams::default(), "BTC", 10.0);
         assert!(routes.is_empty(), "fees must dominate: {routes:?}");
+    }
+
+    /// Regression: the delta contract_value bug (2026-10-03). Delta tickers
+    /// quote premiums per 1 unit of underlying; dividing by the 0.001 lot
+    /// quantum inflated prices ×1000 and the cycle search happily built
+    /// million-dollar phantom routes. Theoretical bounds (call ≤ spot,
+    /// put ≤ strike) must reject those legs at the source.
+    #[test]
+    fn unit_artifact_quotes_rejected_by_theoretical_bounds() {
+        // A "call" bidding $1.85M on $84k spot: 22× the underlying.
+        let okx = leg(5_880.0, 5_900.0, 2.0, 2.0, 1_000);
+        let delta = leg(1_857_000.0, 1_858_000.0, 5.0, 5.0, 1_000);
+        let fams = vec![
+            FamilyQuotes { venue: "okx", fee_rate: 0.0003, contract_size: 1.0, call: Some(&okx), put: None },
+            FamilyQuotes { venue: "delta", fee_rate: 0.0003, contract_size: 0.001, call: Some(&delta), put: None },
+        ];
+        let key = InstKey { und: 0, date: 20261230, strike_ticks: 84_000_000, right: RIGHT_CALL };
+        let routes = scan_family(&key, &fams, 84_000.0, 2_000, 45_000, &MultihopParams::default(), "BTC", 10.0);
+        assert!(routes.is_empty(), "phantom route must be rejected by premium bounds: {routes:?}");
+
+        // Same scenario with a PUT family: put bound is the strike (84k),
+        // a $1.8M put bid is equally impossible.
+        let okx_put = leg(5_400.0, 5_440.0, 2.0, 2.0, 1_000);
+        let delta_put = leg(1_900_000.0, 1_902_000.0, 5.0, 5.0, 1_000);
+        let fams = vec![
+            FamilyQuotes { venue: "okx", fee_rate: 0.0003, contract_size: 1.0, call: None, put: Some(&okx_put) },
+            FamilyQuotes { venue: "delta", fee_rate: 0.0003, contract_size: 0.001, call: None, put: Some(&delta_put) },
+        ];
+        let key = InstKey { und: 0, date: 20261230, strike_ticks: 84_000_000, right: RIGHT_CALL };
+        let routes = scan_family(&key, &fams, 84_000.0, 2_000, 45_000, &MultihopParams::default(), "BTC", 10.0);
+        assert!(routes.is_empty(), "phantom put route must be rejected: {routes:?}");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use leptos::prelude::*;
 use crate::app::SectionHead;
 use crate::fmt;
 use crate::state::ApiState;
-use ivarb_protocol::{ExecCommand, ExecLevel, ExecMode, ExitReason, Position, Tier, Trade};
+use ivarb_protocol::{ExecCommand, ExecLevel, ExecMode, ExecSettings, ExitReason, Position, Tier, Trade};
 
 #[component]
 pub fn TakerSection() -> impl IntoView {
@@ -61,12 +61,15 @@ fn ControlBar(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
     let st_kill = st.clone();
     let st_reset = st.clone();
     let st_flat = st.clone();
+    let st_routes = st.clone();
     let s1 = s.clone();
     let s2 = s.clone();
     let s3 = s.clone();
     let s4 = s.clone();
     let s5 = s.clone();
     let s6 = s.clone();
+    let s7 = s.clone();
+    let s8 = s.clone();
 
     let mode_label = match s.stats.mode {
         ExecMode::Paper => "PAPER",
@@ -119,6 +122,29 @@ fn ControlBar(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
                         </button>
                     }.into_any(),
                 }}
+                {if s7.settings.routes_enabled {
+                    view! {
+                        <button class="tb-btn routes on"
+                            on:click=move |_| {
+                                let mut set = s7.settings.clone();
+                                set.routes_enabled = false;
+                                st_routes.send_exec_cmd(ExecCommand::UpdateSettings { settings: set }, "multi-leg route cycles OFF".into())
+                            }>
+                            "◈ ROUTES ON"
+                        </button>
+                    }.into_any()
+                } else {
+                    view! {
+                        <button class="tb-btn routes off"
+                            on:click=move |_| {
+                                let mut set = s7.settings.clone();
+                                set.routes_enabled = true;
+                                st_routes.send_exec_cmd(ExecCommand::UpdateSettings { settings: set }, "multi-leg route cycles ON — auto-firing quality-gated cycles".into())
+                            }>
+                            "◈ ROUTES OFF"
+                        </button>
+                    }.into_any()
+                }}
                 <button class="tb-btn flat"
                     on:click=move |_| st_flat.send_exec_cmd(ExecCommand::FlattenAll, "flatten-all requested".into())>
                     "FLATTEN ALL"
@@ -141,6 +167,10 @@ fn ControlBar(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
                     <div class="tbm-bar"><div class="tbm-fill" style=move || format!("width:{vega_pct:.0}%")></div></div>
                 </div>
                 <Meter label="attempts" value=format!("{} total · {} live", s6.stats.attempts_total, s6.stats.attempts_active) class_extra=""/>
+                <Meter label="route cycles" value=format!("{} fired · {} live · {} banked", s6.stats.route_attempts, s6.stats.route_attempts_active, s6.stats.route_banked)
+                    class_extra={if s6.stats.route_banked > 0 { "pos" } else { "" }}/>
+                <Meter label="route P&L" value=fmt::fmt_usd(s6.stats.route_profit_usd)
+                    class_extra={if s6.stats.route_profit_usd >= 0.0 { "pos" } else { "neg" }}/>
                 <Meter label="single-leg events" value=s6.stats.single_leg_events.to_string()
                     class_extra={if s6.stats.single_leg_events > 0 { "neg" } else { "" }}/>
                 <Meter label="capture ratio" value={if s6.stats.trades_closed > 0 { format!("{:.0}% of signal", s6.stats.capture_ratio * 100.0) } else { "—".into() }} class_extra=""/>
@@ -296,7 +326,13 @@ fn TradeRow(t: Trade) -> impl IntoView {
             <td class="mono">{format!("{:.2}", t.units)}</td>
             <td class=move || format!("mono {}", if pos { "net-pos" } else { "net-neg" })>{fmt::fmt_usd(t.realized_usd)}</td>
             <td class=move || format!("mono {}", if t.slippage_vp >= 0.0 { "net-pos" } else { "net-neg" })>{fmt::fmt_vp(t.realized_vp)}</td>
-            <td class="mono dim">{format!("{:+.2} vp slip", t.slippage_vp)}</td>
+            <td class="mono dim">{
+                if t.legs.is_empty() {
+                    format!("{:+.2} vp slip", t.slippage_vp)
+                } else {
+                    format!("{} legs · {} hops", t.legs.len(), t.legs.iter().filter(|l| l.action == "convert").count())
+                }
+            }</td>
             <td class="mono dim">{fmt_hold(t.hold_s)}</td>
             <td><span class=format!("exit-chip {}", exit_class(&t.exit_reason))>{exit_label(&t.exit_reason)}</span></td>
         </tr>
@@ -418,7 +454,7 @@ fn StrategyMatrix(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
                 <table class="tk-table matrix">
                     <thead><tr>
                         <th>"Theta bucket"</th><th>"Gate ×"</th><th>"Patience"</th>
-                        <th>"Max hold"</th><th>"E[hold]"</th><th>"Size ×"</th>
+                        <th>"Max hold"</th><th>"θ budget"</th><th>"Size ×"</th>
                     </tr></thead>
                     <tbody>
                         <tr><td>"0–2 days"</td><td class="mono">"×1.6"</td><td>"8 min"</td><td>"45 min"</td><td>"0.03 d"</td><td>"×0.5"</td></tr>
@@ -453,6 +489,7 @@ fn tier_class(t: &Tier) -> &'static str {
     match t {
         Tier::Sniper => "sniper",
         Tier::Convergence => "conv",
+        Tier::Route => "route",
         Tier::Monitor => "watch",
     }
 }
@@ -468,8 +505,8 @@ fn level_class(l: &ExecLevel) -> &'static str {
 
 fn exit_class(r: &ExitReason) -> &'static str {
     match r {
-        ExitReason::TakeProfit | ExitReason::Trail => "take",
-        ExitReason::Stop | ExitReason::Killed => "stop",
+        ExitReason::TakeProfit | ExitReason::Trail | ExitReason::RouteBanked => "take",
+        ExitReason::Stop | ExitReason::Killed | ExitReason::RouteUnwound => "stop",
         ExitReason::ThetaBudget => "theta",
         _ => "neutral",
     }
@@ -486,6 +523,8 @@ fn exit_label(r: &ExitReason) -> &'static str {
         ExitReason::Manual => "MANUAL",
         ExitReason::Killed => "KILLED",
         ExitReason::Expiry => "EXPIRY",
+        ExitReason::RouteBanked => "ROUTE BANKED",
+        ExitReason::RouteUnwound => "ROUTE UNWOUND",
     }
 }
 

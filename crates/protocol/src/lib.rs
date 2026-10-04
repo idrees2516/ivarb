@@ -74,6 +74,10 @@ pub enum Tier {
     Convergence,
     /// Track and alert only; no orders.
     Monitor,
+    /// Multi-leg route cycle (buy → convert → … → sell) executed as one
+    /// atomic sequenced batch by the route taker; books instantly, no
+    /// open position is carried.
+    Route,
 }
 
 impl Tier {
@@ -82,6 +86,7 @@ impl Tier {
             Tier::Sniper => "SNIPER",
             Tier::Convergence => "CONV",
             Tier::Monitor => "WATCH",
+            Tier::Route => "ROUTE",
         }
     }
 }
@@ -263,6 +268,35 @@ pub enum ExitReason {
     Killed,
     /// Expiry approaching — forced wind-down.
     Expiry,
+    /// Multi-leg route cycle completed flat — cash banked.
+    RouteBanked,
+    /// Multi-leg route cycle broke mid-flight — unwound at a cost.
+    RouteUnwound,
+}
+
+/// One executed leg of a (possibly multi-hop) trade — the atomic fill record
+/// the route sequencer produces per hop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TradeLeg {
+    pub venue: VenueId,
+    /// Canonical instrument name (e.g. `BTC-260930-84000-C`).
+    pub instrument: String,
+    /// buy | sell | convert | unwind | settle | hedge.
+    pub action: String,
+    /// Contracts actually filled (venue lot units).
+    pub contracts: f64,
+    /// Underlying units per contract on this leg's venue.
+    pub contract_size: f64,
+    /// Transacted premium per underlying unit (positive number).
+    pub px_unit: f64,
+    pub fee_usd: f64,
+}
+
+impl TradeLeg {
+    /// Underlying units this leg moved.
+    pub fn units(&self) -> f64 {
+        self.contracts * self.contract_size
+    }
 }
 
 /// A closed round trip.
@@ -297,6 +331,10 @@ pub struct Trade {
     pub exit_reason: ExitReason,
     pub opened_ms: i64,
     pub closed_ms: i64,
+    /// Per-leg execution detail (multi-hop route trades; empty on plain
+    /// two-leg trades).
+    #[serde(default)]
+    pub legs: Vec<TradeLeg>,
 }
 
 /// Runtime risk state + limits of the advantage taker.
@@ -351,6 +389,20 @@ pub struct ExecStats {
     pub profit_factor: f64,
     /// Average realized P&L per closed trade.
     pub avg_trade_usd: f64,
+
+    // ---- multi-leg route execution ----
+    /// Route cycles attempted (auto + manual).
+    #[serde(default)]
+    pub route_attempts: u64,
+    /// Route cycles currently executing.
+    #[serde(default)]
+    pub route_attempts_active: u32,
+    /// Route cycles completed flat and banked.
+    #[serde(default)]
+    pub route_banked: u32,
+    /// Cumulative realized P&L from route cycles, USD.
+    #[serde(default)]
+    pub route_profit_usd: f64,
 }
 
 /// User-tunable settings (all env-overridable, UI-editable at runtime).
@@ -390,10 +442,22 @@ pub struct ExecSettings {
     /// strongly correlated — one vol shock moves all of them at once.
     #[serde(default = "default_max_per_underlying")]
     pub max_per_underlying: u32,
+    /// Multi-leg route execution (buy → convert → … → sell cycles) enabled.
+    #[serde(default = "default_true")]
+    pub routes_enabled: bool,
+    /// Minimum total (at-size) USD profit for a route cycle to fire.
+    #[serde(default = "default_route_min_profit")]
+    pub route_min_profit_usd: f64,
 }
 
 fn default_max_per_underlying() -> u32 {
     2
+}
+fn default_true() -> bool {
+    true
+}
+fn default_route_min_profit() -> f64 {
+    2.0
 }
 
 impl Default for ExecSettings {
@@ -416,6 +480,8 @@ impl Default for ExecSettings {
             hedge_enabled: true,
             hedge_threshold_usd: 250.0,
             max_per_underlying: 2,
+            routes_enabled: true,
+            route_min_profit_usd: 2.0,
         }
     }
 }
@@ -489,6 +555,8 @@ pub enum ExecCommand {
     UpdateSettings { settings: ExecSettings },
     /// Manually take a specific opportunity (still risk-gated).
     Take { opp: String, units: Option<f64> },
+    /// Manually fire a multi-leg route cycle (still risk-gated).
+    TakeRoute { route: String },
     Close { position: u64 },
     FlattenAll,
     /// Deposit paper money onto a venue (treasury funding).
@@ -627,6 +695,11 @@ pub struct MultiHopRoute {
     pub size_units: f64,
     /// Total profit at the executable size, USD.
     pub total_usd: f64,
+    /// Data-confidence score 0..1: quote freshness × depth confidence ×
+    /// two-sidedness across the legs. Expected profit = total_usd × quality;
+    /// the taker fires on that expectation, not the raw print.
+    #[serde(default)]
+    pub quality: f64,
     /// Max quote age across the legs, ms.
     pub max_age_ms: i64,
     pub updated_ms: i64,
@@ -892,6 +965,51 @@ pub struct Snapshot {
     /// Live multi-hop routes.
     #[serde(default)]
     pub multihop: Vec<MultiHopRoute>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            ts_ms: 0,
+            stats: EngineStats::default(),
+            venues: Vec::new(),
+            spots: Vec::new(),
+            opportunities: Vec::new(),
+            holds: Vec::new(),
+            multihop: Vec::new(),
+        }
+    }
+}
+
+impl Default for EngineStats {
+    fn default() -> Self {
+        Self {
+            ts_ms: 0,
+            uptime_s: 0,
+            feed_mode: FeedMode::Sim,
+            venues_live: 0,
+            venues_total: 0,
+            instruments_tracked: 0,
+            opps_active: 0,
+            engine_loop_us_ewma: 0.0,
+            msgs_total: 0,
+            msg_rate: 0.0,
+            pipe_p50_us: 0.0,
+            pipe_p99_us: 0.0,
+            pipe_p999_us: 0.0,
+            wire_p50_us: 0.0,
+            wire_p99_us: 0.0,
+            broadcast_ms: 0,
+            sweep_ms: 0,
+            multihop_routes: 0,
+            holds_tracked: 0,
+            ga_generation: 0,
+            min_net_vp: 0.0,
+            exit_net_vp: 0.0,
+            moneyness_pct: 0.0,
+            min_vega_usd: 0.0,
+        }
+    }
 }
 
 /// Server → client messages, tagged JSON.

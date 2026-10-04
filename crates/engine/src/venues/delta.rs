@@ -146,8 +146,14 @@ impl VenueConnector for Delta {
                         let Some(sym) = js(r, &["symbol"]) else { continue };
                         let Some(m) = products.get(&sym) else { continue };
                         let cv = m.contract_value;
+                        // Delta tickers quote option premiums in USD **per 1
+                        // unit of underlying** (verified live: C-BTC-88000
+                        // mark ≈ $853 on $84.8k spot — the correct per-BTC
+                        // value; `contract_value` is the lot quantum, NOT a
+                        // price divisor). Dividing by it inflated premiums
+                        // ×1000 and fabricated phantom routes.
                         let pxu = |names: &[&str]| -> Option<f64> {
-                            jf(r, names).map(|p| p / cv).filter(|p| p.is_finite() && *p > 0.0)
+                            jf(r, names).filter(|p| p.is_finite() && *p > 0.0)
                         };
                         let quotes = r.get("quotes");
                         let jq = |names: &[&str]| -> Option<f64> {
@@ -163,8 +169,8 @@ impl VenueConnector for Delta {
                             iv_bid_vp: jq(&["bid_iv"]).and_then(norm_iv_vp),
                             iv_ask_vp: jq(&["ask_iv"]).and_then(norm_iv_vp),
                             px_mark_unit: pxu(&["mark_price", "markPrice"]),
-                            px_bid_unit: jq(&["best_bid"]).map(|p| p / cv).filter(|p| p.is_finite() && *p > 0.0),
-                            px_ask_unit: jq(&["best_offer", "best_ask"]).map(|p| p / cv).filter(|p| p.is_finite() && *p > 0.0),
+                            px_bid_unit: jq(&["best_bid"]).filter(|p| p.is_finite() && *p > 0.0),
+                            px_ask_unit: jq(&["best_offer", "best_ask"]).filter(|p| p.is_finite() && *p > 0.0),
                             size_bid: jq(&["bid_size", "best_bid_size"]),
                             size_ask: jq(&["ask_size", "best_ask_size"]),
                             spot,

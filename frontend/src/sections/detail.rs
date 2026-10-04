@@ -131,12 +131,14 @@ fn ExecPlan(o: Opportunity) -> impl IntoView {
     let tier_cls = match tier {
         ivarb_protocol::Tier::Sniper => "sniper",
         ivarb_protocol::Tier::Convergence => "conv",
+        ivarb_protocol::Tier::Route => "route",
         ivarb_protocol::Tier::Monitor => "watch",
     };
     let plan: Vec<(&'static str, String)> = vec![
         ("strategy tier", format!("{} — {}", tier.label(), match tier {
             ivarb_protocol::Tier::Sniper => "both legs at the touch immediately",
             ivarb_protocol::Tier::Convergence => "passive quotes on both venues, capture on convergence",
+            ivarb_protocol::Tier::Route => "multi-hop cycle — fired through the route sequencer (see section 05)",
             ivarb_protocol::Tier::Monitor => "not executable right now (edge below gate or quotes stale)",
         })),
         ("theta bucket", format!("{} ({:.1} days to expiry)", o.bucket, o.dte)),

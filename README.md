@@ -76,15 +76,28 @@ scripts/      build/rebuild helpers
 ## Quickstart
 
 ```bash
-# Backend + dashboard (release)
-cargo build --release --bin ivarb-server
-cd frontend && trunk build --release && cd ..
-./target/release/ivarb-server            # http://localhost:3000
+# One command — builds if needed, then serves the full stack on :3000
+./run.sh                                 # http://localhost:3000
+
+# Rebuild from scratch / run the test suite
+./run.sh --rebuild
+./run.sh --check
+```
+
+`run.sh` starts in **live-feed paper mode**: real venue data when reachable,
+automatic simulation fallback when the host cannot reach the exchanges
+(`IVARB_SIM=auto` — force one or the other with `IVARB_SIM=always|off`).
+For a fully animated demonstration feed:
+
+```bash
+IVARB_SIM=always ./run.sh               # clearly banner-labeled SIM feed
 ```
 
 The taker auto-arms in **paper mode** and starts taking every opportunity
-that passes the risk gates. Simulated fills include latency, depth-aware
-partial fills, slippage and fees.
+that passes the risk gates — two-leg sniper/convergence cycles **and
+multi-leg route cycles** (buy → convert → … → sell, flat at completion).
+Simulated fills include latency, depth-aware partial fills, slippage and
+fees.
 
 ```bash
 # Docker (single image: server + dashboard)

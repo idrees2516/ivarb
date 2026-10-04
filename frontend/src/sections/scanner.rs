@@ -220,6 +220,7 @@ fn tier_cls(t: &ivarb_protocol::Tier) -> &'static str {
     match t {
         ivarb_protocol::Tier::Sniper => "sniper",
         ivarb_protocol::Tier::Convergence => "conv",
+        ivarb_protocol::Tier::Route => "route",
         ivarb_protocol::Tier::Monitor => "watch",
     }
 }

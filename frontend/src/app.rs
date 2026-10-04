@@ -32,6 +32,7 @@ pub fn App() -> impl IntoView {
                 <risk::RiskSection/>
             </main>
             <Footer/>
+            <crate::sidepanel::SidePanel/>
         </div>
     }
 }

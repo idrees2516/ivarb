@@ -17,6 +17,7 @@ pub mod live;
 pub mod machine;
 pub mod paper;
 pub mod risk;
+pub mod route;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -30,13 +31,14 @@ use ivarb_engine::engine::WatchCmd;
 use ivarb_engine::timing::Regime;
 use ivarb_protocol::{
     ExecCommand, ExecEvent, ExecLevel, ExecMode, ExecSettings, ExecSnapshot, ExecStats,
-    ExitReason, LiveStatus, Opportunity, Position, PositionEntry, PositionMtm, Right, Snapshot,
-    TimeRegime, Trade, WatchedLeg,
+    ExitReason, LiveStatus, MultiHopRoute, Opportunity, Position, PositionEntry, PositionMtm,
+    Right, Snapshot, TimeRegime, Trade, WatchedLeg,
 };
 
 use machine::{AttemptCtx, AttemptOutcome, PositionDraft};
 use paper::PaperBroker;
 use risk::{canonical_inst, RiskState};
+use route::{RouteCtx, RouteOutcome};
 
 /// Serialized engine snapshots start with this prefix (`ServerMsg` is
 /// internally tagged) — used to detect "fresh data" on the broadcast bus
@@ -99,6 +101,25 @@ struct Stats {
     capital_peak_usd: f64,
     reserved_time_s: f64,
     reserved_last_t: i64,
+    // multi-leg route cycles
+    route_attempts: u64,
+    route_banked: u32,
+    route_profit_usd: f64,
+}
+
+/// Book-keeping for one in-flight multi-leg route cycle.
+struct ActiveRoute {
+    route_id: String,
+    /// Venue chain, "okx>bybit" style — the calibration key.
+    chain: String,
+    units: f64,
+    capital_usd: f64,
+    signal_usd: f64,
+    started_ms: i64,
+    /// Instruments this attempt registered on the engine watch list.
+    watches: Vec<String>,
+    /// The route as fired (trade blotter detail + unwinding reference).
+    route: MultiHopRoute,
 }
 
 struct Core {
@@ -109,6 +130,8 @@ struct Core {
     attempt_rx: mpsc::Receiver<(u64, AttemptOutcome)>,
     event_tx: mpsc::UnboundedSender<ExecEvent>,
     event_rx: mpsc::UnboundedReceiver<ExecEvent>,
+    route_tx: mpsc::Sender<(u64, RouteOutcome)>,
+    route_rx: mpsc::Receiver<(u64, RouteOutcome)>,
     live_tx: mpsc::UnboundedSender<LiveMsg>,
     live_rx: mpsc::UnboundedReceiver<LiveMsg>,
     broker: Arc<PaperBroker>,
@@ -127,6 +150,10 @@ struct Core {
     positions: FxHashMap<u64, Position>,
     /// attempt id → (opp, reserved units) for release accounting.
     live_attempts: FxHashMap<u64, (Opportunity, f64)>,
+    /// In-flight multi-leg route cycles (attempt id → book-keeping).
+    route_active: FxHashMap<u64, ActiveRoute>,
+    /// route id → next-allowed fire time (cooldown after abort/unwind/bank).
+    route_cooldown: FxHashMap<String, i64>,
     trades: VecDeque<Trade>,
     events: VecDeque<ExecEvent>,
     stats: Stats,
@@ -156,6 +183,7 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ExecCommand>();
     let (attempt_tx, attempt_rx) = mpsc::channel::<(u64, AttemptOutcome)>(64);
     let (event_tx, event_rx) = mpsc::unbounded_channel::<ExecEvent>();
+    let (route_tx, route_rx) = mpsc::channel::<(u64, RouteOutcome)>(16);
 
     let venue_ids: Vec<String> = deps
         .snapshot
@@ -193,6 +221,8 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
         mode,
         positions: FxHashMap::default(),
         live_attempts: FxHashMap::default(),
+        route_active: FxHashMap::default(),
+        route_cooldown: FxHashMap::default(),
         trades: VecDeque::with_capacity(64),
         events: VecDeque::with_capacity(256),
         stats: Stats {
@@ -215,6 +245,9 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
             capital_peak_usd: 0.0,
             reserved_time_s: 0.0,
             reserved_last_t: now_ms(),
+            route_attempts: 0,
+            route_banked: 0,
+            route_profit_usd: 0.0,
         },
         risk: RiskState::new(),
         calib: calib::Calib::new(),
@@ -229,6 +262,8 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
         cmd_rx,
         attempt_tx,
         attempt_rx,
+        route_tx,
+        route_rx,
         event_tx,
         event_rx,
         live_tx: live_tx.clone(),
@@ -353,6 +388,12 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
                         None => break,
                     }
                 }
+                r = core.route_rx.recv() => {
+                    match r {
+                        Some(x) => core.handle_route_outcome(x),
+                        None => break,
+                    }
+                }
                 ev = core.event_rx.recv() => {
                     if let Some(e) = ev {
                         core.events.push_back(e);
@@ -436,6 +477,10 @@ fn empty_snapshot(mode: ExecMode) -> ExecSnapshot {
             losses: 0,
             profit_factor: 0.0,
             avg_trade_usd: 0.0,
+            route_attempts: 0,
+            route_attempts_active: 0,
+            route_banked: 0,
+            route_profit_usd: 0.0,
         },
         settings: ExecSettings::default(),
         regime: TimeRegime {
@@ -537,6 +582,9 @@ impl Core {
             }
             ExecCommand::Take { opp, units } => {
                 self.manual_take(&opp, units);
+            }
+            ExecCommand::TakeRoute { route } => {
+                self.manual_take_route(&route);
             }
             ExecCommand::Close { position } => {
                 if let Some(p) = self.positions.get_mut(&position) {
@@ -817,6 +865,18 @@ impl Core {
         }
         let snap = self.deps.snapshot.load();
         let now = now_ms();
+        // Venue accounts: provision paper accounts for venues that
+        // registered after boot (sim feeds / late connects) so funding
+        // never silently starves a tradeable route.
+        for v in &snap.venues {
+            if self.broker.ensure_venue(&v.venue) {
+                self.ev(None, ExecLevel::Info, "treasury", format!("paper account provisioned for {} ({} USD)", v.venue, 250_000));
+            }
+        }
+        // Multi-leg route cycles run on their own gate set and concurrency
+        // budget (they are flat-at-completion, so they never contend with
+        // the open-position caps the two-leg taker respects).
+        self.scan_routes(&snap, now);
         // Candidates: the engine's ms-fresh light cache when populated
         // (written every analytics pass, ~250 ms), else the full snapshot's
         // list (1 s cadence). Both carry the same Opportunity shape.
@@ -985,6 +1045,415 @@ impl Core {
         }
     }
 
+    // ------------------------------------------------------------------
+    // multi-leg route cycles (buy → convert → … → sell, flat at completion)
+    // ------------------------------------------------------------------
+
+    /// Auto-fire pass over the engine's live multi-hop routes. Gates:
+    /// routes enabled, fresh quotes, quality-adjusted expectation above the
+    /// floor, not on cooldown, not flickering, and per-venue capital at the
+    /// sized amount. Ranked best-expected-first.
+    fn scan_routes(&mut self, snap: &Snapshot, now: i64) {
+        if !self.settings.routes_enabled || self.kill.is_some() || !self.armed {
+            return;
+        }
+        if matches!(self.mode, ExecMode::Live) {
+            // Route cycles execute through the paper fill engine; a paper
+            // leg inside a live attempt is forbidden, so live mode runs no
+            // route cycles until every leg's venue has a live gateway.
+            return;
+        }
+        const MAX_CONCURRENT_ROUTES: usize = 2;
+        if self.route_active.len() >= MAX_CONCURRENT_ROUTES || snap.multihop.is_empty() {
+            return;
+        }
+        let mut cands: Vec<&MultiHopRoute> = snap.multihop.iter().collect();
+        cands.sort_by(|a, b| (b.total_usd * b.quality).total_cmp(&(a.total_usd * a.quality)));
+        for r in cands {
+            if self.route_active.len() >= MAX_CONCURRENT_ROUTES {
+                break;
+            }
+            if self.route_active.values().any(|a| a.route_id == r.id) {
+                continue;
+            }
+            if let Some(&until) = self.route_cooldown.get(&r.id) {
+                if now < until {
+                    continue;
+                }
+            }
+            // Fresh quotes only — a route on stale books is a coin flip.
+            if r.max_age_ms > 6_000 {
+                continue;
+            }
+            let chain = route_chain(r);
+            if self.calib.flicker(&chain) {
+                continue;
+            }
+            // Expectation gate: raw profit × data confidence × learned
+            // route capture must clear the configured floor.
+            let expected = r.total_usd * r.quality * self.calib.edge_mult(&chain);
+            if expected < self.settings.route_min_profit_usd {
+                continue;
+            }
+            self.try_fire_route(r, false, now);
+        }
+    }
+
+    /// Gate + size + spawn one route cycle. `manual` bypasses the armed and
+    /// routes-enabled flags (a human clicked TAKE) but respects the kill
+    /// switch, live-mode doctrine and every capital gate.
+    fn try_fire_route(&mut self, route: &MultiHopRoute, manual: bool, now: i64) {
+        let snap = self.deps.snapshot.load();
+        let spot = snap
+            .spots
+            .iter()
+            .find(|s| s.underlying == route.underlying)
+            .map(|s| s.price)
+            .unwrap_or(0.0);
+        if spot <= 0.0 {
+            if manual {
+                self.ev(Some(route.id.clone()), ExecLevel::Error, "route", format!("no spot for {} — cannot size the cycle", route.underlying));
+            }
+            return;
+        }
+        // ---- theoretical premium bounds (defense in depth) -----------------
+        // The scanner already enforces these; a route that still carries an
+        // impossible price (call > spot, put > strike) is a venue-unit
+        // artifact and must never reserve capital or fire.
+        {
+            let call_cap = spot * 1.05;
+            let put_cap = route.strike * 1.05;
+            for leg in &route.legs {
+                let cap = if right_from_inst(&leg.instrument) == Right::Put { put_cap } else { call_cap };
+                if leg.px_unit.abs() > cap {
+                    self.ev(
+                        Some(route.id.clone()),
+                        ExecLevel::Error,
+                        "route",
+                        format!(
+                            "route refused: {} leg on {} prints {} — above the theoretical bound {} (venue-unit artifact, not an edge)",
+                            leg.action, leg.venue, fmt_px(leg.px_unit), fmt_px(cap)
+                        ),
+                    );
+                    self.route_cooldown.insert(route.id.clone(), now + 300_000);
+                    return;
+                }
+            }
+        }
+        // ---- per-venue capital per underlying unit -------------------------
+        let mut venue_cost: FxHashMap<&str, f64> = FxHashMap::default();
+        for leg in &route.legs {
+            let vspec = snap.venues.iter().find(|v| v.venue == leg.venue);
+            let ct = vspec
+                .and_then(|v| (v.contract_size > 0.0).then_some(v.contract_size))
+                .unwrap_or(1.0);
+            let fee = if leg.fee_unit > 0.0 {
+                leg.fee_unit
+            } else {
+                0.0003 * spot
+            };
+            let add = match leg.action.as_str() {
+                // Long premium + fee, funded on the buy venue.
+                "buy" => leg.px_unit.abs() + fee,
+                // Short-option margin (venue formula, buffered) + fee.
+                "sell" => {
+                    let right = quant_right_from_inst(&leg.instrument);
+                    ivarb_quant::margin_per_contract(
+                        &leg.venue,
+                        leg.px_unit.abs(),
+                        ct,
+                        spot,
+                        route.strike,
+                        right,
+                    ) * (1.0 + ivarb_quant::MARGIN_BUFFER)
+                        / ct
+                        + fee
+                }
+                // Conversion: fund the target purchase + fees + perp legs.
+                _ => leg.px_unit.abs().max(0.0) + 2.0 * fee + 0.001 * spot,
+            };
+            *venue_cost.entry(leg.venue.as_str()).or_insert(0.0) += add;
+        }
+        let total_cost_unit: f64 = venue_cost.values().sum();
+
+        // ---- sizing: executable size, taker cap, per-venue affordability ---
+        let mut units = route.size_units.min(self.settings.max_units_per_trade);
+        for leg in &route.legs {
+            self.broker.ensure_venue(&leg.venue);
+        }
+        let balances: FxHashMap<String, f64> = self.broker.balances().into_iter().collect();
+        let mut tightest: (String, f64) = (String::new(), units);
+        for (v, cost_unit) in &venue_cost {
+            if *cost_unit > 1e-9 {
+                let afford = balances.get(*v).copied().unwrap_or(0.0) * 0.90 / cost_unit;
+                if afford < tightest.1 {
+                    tightest = (v.to_string(), afford);
+                }
+            }
+        }
+        units = tightest.1.min(units);
+        let capital = units * total_cost_unit;
+        if units < 0.01 {
+            let msg = format!(
+                "route refused: insufficient capital on {} — needs ~{:.0} USD/unit, {:.0} available (deposit funds in the Funding & capital panel)",
+                if tightest.0.is_empty() { "venues" } else { &tightest.0 },
+                total_cost_unit,
+                balances.values().sum::<f64>(),
+            );
+            if manual {
+                self.ev(Some(route.id.clone()), ExecLevel::Error, "route", msg);
+            } else {
+                // Size down silently in the auto pass — the scanner will
+                // re-present the route when funding allows.
+                self.route_cooldown.insert(route.id.clone(), now + 60_000);
+            }
+            return;
+        }
+
+        // ---- book-keeping + spawn -----------------------------------------
+        let attempt = self.next_id;
+        self.next_id += 1;
+        let chain = route_chain(route);
+        self.stats.route_attempts += 1;
+        self.calib.record_attempt(&chain);
+        self.stats.capital_reserved_usd += capital;
+        self.stats.capital_peak_usd = self.stats.capital_peak_usd.max(self.stats.capital_reserved_usd);
+
+        // Watch every instrument the cycle touches (conversions need both
+        // rights of the family) so the engine keeps their quotes live.
+        let mut watches: Vec<String> = Vec::new();
+        for leg in &route.legs {
+            let mut insts = vec![leg.instrument.clone()];
+            if leg.action == "convert" {
+                insts.push(route::flip_right(&leg.instrument));
+            }
+            for inst in insts {
+                if self.watch_set.insert(inst.clone()) {
+                    watches.push(inst);
+                    self.watch_dirty = true;
+                }
+            }
+        }
+
+        let fee_rates: FxHashMap<String, f64> = snap
+            .venues
+            .iter()
+            .map(|v| (v.venue.clone(), v.taker_fee_rate))
+            .collect();
+        // Expectation AT THE FIRED SIZE — the scanner's total is at the
+        // route's full executable size; when capital sizes the cycle down,
+        // the promise (and later the capture ratio) must scale with it.
+        let expected = route.profit_unit_usd * units * route.quality * self.calib.edge_mult(&chain);
+        self.ev(
+            Some(route.id.clone()),
+            ExecLevel::Warn,
+            "route/fire",
+            format!(
+                "{} ROUTE #{} — {} legs via {}, {:.2} u, expected {:+.2} USD (print {:+.2} × quality {:.0}% × learned capture), capital {:.0} USD",
+                if manual { "manual" } else { "auto" },
+                attempt,
+                route.legs.len(),
+                chain,
+                units,
+                expected,
+                route.total_usd,
+                100.0 * route.quality,
+                capital,
+            ),
+        );
+        self.route_active.insert(
+            attempt,
+            ActiveRoute {
+                route_id: route.id.clone(),
+                chain: chain.clone(),
+                units,
+                capital_usd: capital,
+                signal_usd: route.profit_unit_usd * units,
+                started_ms: now,
+                watches,
+                route: route.clone(),
+            },
+        );
+
+        let ctx = RouteCtx {
+            attempt,
+            route: route.clone(),
+            spot,
+            settings: self.settings.clone(),
+            broker: self.broker.clone(),
+            watched: self.deps.watched.clone(),
+            snapshot: self.deps.snapshot.clone(),
+            events: self.event_tx.clone(),
+            fee_rates,
+        };
+        let route_tx = self.route_tx.clone();
+        tokio::spawn(async move {
+            let outcome = route::run_route(ctx, units).await;
+            let _ = route_tx.send((attempt, outcome)).await;
+        });
+        self.dirty = true;
+    }
+
+    /// Manual TAKE of a specific multi-hop route from the UI.
+    fn manual_take_route(&mut self, route_id: &str) {
+        let snap = self.deps.snapshot.load();
+        let Some(r) = snap.multihop.iter().find(|r| r.id == route_id).cloned() else {
+            self.ev(Some(route_id.to_string()), ExecLevel::Error, "route", "route not found (it may have just retired)".into());
+            return;
+        };
+        drop(snap);
+        if self.kill.is_some() {
+            self.ev(Some(route_id.to_string()), ExecLevel::Error, "route", "kill switch engaged — reset it before taking routes".into());
+            return;
+        }
+        if matches!(self.mode, ExecMode::Live) {
+            self.ev(Some(route_id.to_string()), ExecLevel::Error, "route", "route cycles run on the paper fill engine — live multi-leg routing activates when every leg's venue has a live gateway".into());
+            return;
+        }
+        self.try_fire_route(&r, true, now_ms());
+    }
+
+    /// Terminal outcome of a route cycle: bank the result, release capital,
+    /// clean the watch list, record the trade + calibration sample.
+    fn handle_route_outcome(&mut self, (attempt, outcome): (u64, RouteOutcome)) {
+        let Some(ar) = self.route_active.remove(&attempt) else {
+            return;
+        };
+        let now = now_ms();
+        // Release the reserved capital.
+        self.stats.capital_reserved_usd = (self.stats.capital_reserved_usd - ar.capital_usd).max(0.0);
+        // Unregister watches no position and no other route still needs.
+        for inst in &ar.watches {
+            let needed = self
+                .positions
+                .values()
+                .any(|p| canonical_inst_of_pos(p) == *inst)
+                || self.route_active.values().any(|r| r.watches.contains(inst));
+            if !needed {
+                self.watch_set.remove(inst);
+                self.watch_dirty = true;
+            }
+        }
+        match outcome {
+            RouteOutcome::Banked { profit_usd, fees_usd, hedge_pnl_usd, units, legs } => {
+                self.stats.route_banked += 1;
+                self.stats.route_profit_usd += profit_usd;
+                self.stats.realized_usd += profit_usd;
+                self.stats.fees_usd += fees_usd;
+                self.stats.fills_total += legs.len() as u32;
+                self.stats.trades_closed += 1;
+                if profit_usd >= 0.0 {
+                    self.stats.wins += 1;
+                    self.stats.gross_wins += profit_usd;
+                } else {
+                    self.stats.losses += 1;
+                    self.stats.gross_losses += (-profit_usd).max(0.0);
+                }
+                let capture = if ar.signal_usd > 1e-9 {
+                    (profit_usd / ar.signal_usd).clamp(-2.0, 2.0)
+                } else {
+                    0.0
+                };
+                self.stats.capture_sum += capture;
+                self.stats.capture_n += 1.0;
+                self.calib.record_close(&ar.chain, capture);
+                self.route_cooldown.insert(ar.route_id.clone(), now + 45_000);
+                self.book_route_trade(&ar, units, profit_usd, fees_usd, hedge_pnl_usd, legs, ExitReason::RouteBanked);
+                self.ev(
+                    Some(ar.route_id.clone()),
+                    ExecLevel::Ok,
+                    "route/banked",
+                    format!("route cycle #{} banked {:+.2} USD — capture {:.0}% of the {} USD signal", attempt, profit_usd, 100.0 * capture, ar.signal_usd),
+                );
+            }
+            RouteOutcome::Aborted { reason, cooldown_ms } => {
+                self.calib.record_abort(&ar.chain);
+                self.route_cooldown.insert(ar.route_id.clone(), now + cooldown_ms.max(10_000) as i64);
+                self.ev(
+                    Some(ar.route_id.clone()),
+                    ExecLevel::Info,
+                    "route/abort",
+                    format!("route cycle #{} aborted before fire: {}", attempt, reason),
+                );
+            }
+            RouteOutcome::Unwound { reason, profit_usd, fees_usd, hedge_pnl_usd, units, legs } => {
+                self.stats.single_leg_events += 1;
+                self.stats.realized_usd += profit_usd;
+                self.stats.fees_usd += fees_usd;
+                self.stats.fills_total += legs.len() as u32;
+                self.stats.trades_closed += 1;
+                if profit_usd >= 0.0 {
+                    self.stats.wins += 1;
+                    self.stats.gross_wins += profit_usd;
+                } else {
+                    self.stats.losses += 1;
+                    self.stats.gross_losses += (-profit_usd).max(0.0);
+                }
+                self.calib.record_abort(&ar.chain);
+                self.route_cooldown.insert(ar.route_id.clone(), now + 120_000);
+                self.book_route_trade(&ar, units, profit_usd, fees_usd, hedge_pnl_usd, legs, ExitReason::RouteUnwound);
+                self.ev(
+                    Some(ar.route_id.clone()),
+                    ExecLevel::Error,
+                    "route/unwind",
+                    format!("route cycle #{} broke mid-flight: {} — P&L impact {:+.2} USD, flat", attempt, reason, profit_usd),
+                );
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Append the route cycle's round-trip record to the trade blotter.
+    fn book_route_trade(
+        &mut self,
+        ar: &ActiveRoute,
+        units: f64,
+        profit_usd: f64,
+        fees_usd: f64,
+        hedge_pnl_usd: f64,
+        legs: Vec<ivarb_protocol::TradeLeg>,
+        reason: ExitReason,
+    ) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let now = now_ms();
+        let first = &ar.route.legs[0];
+        let last = ar.route.legs.last().unwrap_or(first);
+        let drift = profit_usd - ar.signal_usd + fees_usd - hedge_pnl_usd;
+        self.stats.gross_locked_usd += ar.signal_usd;
+        self.stats.exit_drift_usd += drift;
+        self.stats.hedge_pnl_usd += hedge_pnl_usd;
+        let trade = Trade {
+            id,
+            opp: ar.route_id.clone(),
+            underlying: ar.route.underlying.clone(),
+            expiry: ar.route.expiry.clone(),
+            strike: ar.route.strike,
+            right: right_from_inst(&first.instrument),
+            buy_venue: first.venue.clone(),
+            sell_venue: last.venue.clone(),
+            units,
+            tier: ivarb_protocol::Tier::Sniper,
+            realized_vp: 0.0,
+            realized_usd: profit_usd,
+            slippage_vp: 0.0,
+            fees_usd,
+            gross_locked_usd: ar.signal_usd,
+            exit_drift_usd: drift,
+            capital_usd: ar.capital_usd,
+            hedge_pnl_usd,
+            hold_s: ((now - ar.started_ms).max(0) as f64) / 1000.0,
+            exit_reason: reason,
+            opened_ms: ar.started_ms,
+            closed_ms: now,
+            legs,
+        };
+        self.trades.push_back(trade);
+        while self.trades.len() > 64 {
+            self.trades.pop_front();
+        }
+    }
+
     fn spawn_attempt(&mut self, opp: Opportunity, units: f64) {
         let attempt = self.next_id;
         self.next_id += 1;
@@ -1033,7 +1502,7 @@ impl Core {
             let outcome = match tier {
                 ivarb_protocol::Tier::Sniper => machine::run_sniper(ctx, units).await,
                 ivarb_protocol::Tier::Convergence => machine::run_convergence(ctx, units).await,
-                ivarb_protocol::Tier::Monitor => AttemptOutcome::Aborted { reason: "monitor tier".into(), cooldown_ms: 0 },
+                ivarb_protocol::Tier::Route | ivarb_protocol::Tier::Monitor => AttemptOutcome::Aborted { reason: "route cycles fire through the route sequencer".into(), cooldown_ms: 0 },
             };
             let _ = attempt_tx.send((attempt, outcome)).await;
         });
@@ -1554,6 +2023,7 @@ impl Core {
             exit_reason: reason,
             opened_ms: p.entry.t_ms,
             closed_ms: now,
+            legs: Vec::new(),
         };
         self.trades.push_front(trade);
         while self.trades.len() > 50 {
@@ -1569,6 +2039,8 @@ impl Core {
             ExitReason::Manual => "manual close",
             ExitReason::Killed => "kill switch",
             ExitReason::Expiry => "expiry approaching",
+            ExitReason::RouteBanked => "multi-leg route banked",
+            ExitReason::RouteUnwound => "multi-leg route unwound",
         };
         let capture_pct = 100.0 * (realized_vp / p.entry.signal_net_vp).clamp(-5.0, 5.0);
         self.ev(
@@ -1645,6 +2117,10 @@ impl Core {
                 } else {
                     0.0
                 },
+                route_attempts: self.stats.route_attempts,
+                route_attempts_active: self.route_active.len() as u32,
+                route_banked: self.stats.route_banked,
+                route_profit_usd: self.stats.route_profit_usd,
             },
             settings: self.settings.clone(),
             regime: TimeRegime {
@@ -1710,6 +2186,40 @@ fn canonical_inst_of_pos(p: &Position) -> String {
         ivarb_protocol::fmt_strike_id(p.strike),
         p.right.letter()
     )
+}
+
+/// Venue chain of a multi-hop route — the calibration key ("okx>bybit").
+fn route_chain(r: &MultiHopRoute) -> String {
+    r.legs
+        .iter()
+        .map(|l| l.venue.as_str())
+        .collect::<Vec<_>>()
+        .join(">")
+}
+
+/// Option right from a canonical instrument name ("…-C" / "…-P").
+fn right_from_inst(inst: &str) -> Right {
+    match inst.rsplit('-').next().and_then(|s| s.chars().next()) {
+        Some('P') => Right::Put,
+        _ => Right::Call,
+    }
+}
+
+/// Compact USD formatting for refusal events.
+fn fmt_px(x: f64) -> String {
+    if x.abs() >= 1000.0 {
+        format!("${x:.0}")
+    } else {
+        format!("${x:.2}")
+    }
+}
+
+/// Quant-crate right from a canonical instrument name.
+fn quant_right_from_inst(inst: &str) -> ivarb_quant::QuantRight {
+    match right_from_inst(inst) {
+        Right::Put => ivarb_quant::QuantRight::Put,
+        Right::Call => ivarb_quant::QuantRight::Call,
+    }
 }
 
 fn fmt_dur(s: f64) -> String {

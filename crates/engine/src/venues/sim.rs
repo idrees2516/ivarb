@@ -192,8 +192,12 @@ impl VenueConnector for SimVenue {
 
             let now = now_ms();
             for u in &mut unds {
-                // Spot: log-OU around the anchor, ~0.8% vol.
-                u.ou += -u.ou * (dt_s / 180.0) + 0.008 * dt_s.sqrt() * normal(&mut rng);
+                // Spot: log-OU around the anchor. Vol scaled so the
+                // stationary cross-venue dispersion is ~0.8 % — wide enough
+                // to create tradeable premium dislocations, sane enough that
+                // box-style routes bank believable money instead of fantasy
+                // millions off 10 % spot gaps.
+                u.ou += -u.ou * (dt_s / 180.0) + 0.0009 * dt_s.sqrt() * normal(&mut rng);
                 let spot = u.anchor * u.ou.exp();
 
                 let _ = ctx
@@ -208,8 +212,11 @@ impl VenueConnector for SimVenue {
 
                 for e in &mut u.expiries {
                     // Divergence events: occasionally shift a whole expiry smile.
+                    // Magnitudes tuned so demo edges look like real vol
+                    // dislocations (0.5–1.8 vp), not fantasy: wide drifts
+                    // compound through multi-hop cycles into absurd boxes.
                     if rng.gen::<f64>() < dt_s / 240.0 {
-                        let mag = 1.8 + 3.7 * rng.gen::<f64>();
+                        let mag = 0.5 + 1.3 * rng.gen::<f64>();
                         e.drift_vp = if rng.gen::<f64>() < 0.5 { -mag } else { mag };
                         e.drift_tau_ms = rng.gen_range(150_000.0..300_000.0);
                     }
@@ -218,7 +225,10 @@ impl VenueConnector for SimVenue {
                     let t = ((e.expiry_ms - now).max(1) as f64 / YEAR_MS).max(1e-4);
                     let mut ticks: Vec<InstrTick> = Vec::with_capacity(64);
                     for inst in &mut e.insts {
-                        if rng.gen::<f64>() > 0.30 {
+                        // Publish most instruments every tick — a 30 % lottery
+                        // starves multi-leg routes of quotes inside their
+                        // fire window and turns every cycle into an unwind.
+                        if rng.gen::<f64>() > 0.92 {
                             continue;
                         }
                         inst.noise_vp += -inst.noise_vp * (dt_s * 1000.0 / inst.hl_ms)

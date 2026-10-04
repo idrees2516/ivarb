@@ -76,6 +76,18 @@ impl PaperBroker {
         self.start_balance
     }
 
+    /// Provision an account for a venue that registered after boot (sim
+    /// feeds, late venue connects): same starting balance as the boot set.
+    /// Returns true when a new account was created.
+    pub fn ensure_venue(&self, venue: &str) -> bool {
+        let mut b = self.balances.lock().unwrap();
+        if b.contains_key(venue) {
+            return false;
+        }
+        b.insert(venue.to_string(), self.start_balance);
+        true
+    }
+
     pub fn balances(&self) -> Vec<(String, f64)> {
         let b = self.balances.lock().unwrap();
         let mut v: Vec<(String, f64)> = b.iter().map(|(k, x)| (k.clone(), *x)).collect();

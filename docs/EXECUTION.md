@@ -146,6 +146,56 @@ spot| > hedge_threshold_usd` (default $250), the monitor trades the
 underlying on the buy-leg venue to flatten it. Hedge P&L is tracked
 separately (`hedge_pnl_usd`) so attribution stays honest.
 
+## Multi-leg route cycles (`route.rs`)
+
+Where the two-leg FSMs monetize one contract priced differently on two
+venues, route cycles monetize **chains**: buy a call on okx, convert it to
+a put on the same venue via put-call parity (perp-hedged), sell the put on
+bybit — every hop executable, the whole cycle flat at completion.
+
+**Discovery** (`engine/multihop.rs`) — negative-cycle search over the
+(venue × right) graph per strike family, re-scanned every 250 ms on
+touched families. Routes are ranked by **expected profit**: raw profit ×
+a data-confidence `quality` factor (quote freshness × depth confidence ×
+two-sidedness). A fat printed edge resting on stale, thin or one-sided
+books ranks below a modest edge on solid books — expectation is what the
+taker chases. Hard theoretical bounds (call ≤ spot, put ≤ strike, +5%
+headroom) reject venue-unit artifacts at the source; routes whose legs
+publish no executable size are dropped (a cycle you cannot size is not an
+opportunity).
+
+**Sequencing** (`executor/route.rs`) — the cycle is one atomic batch of
+taker fills with contingency at every step:
+
+1. *Feasible hardest-first ordering* — a `convert` needs its source right
+   on that venue, so the order respects data dependencies; among legs
+   executable now, the thinnest book fires first.
+2. *Signal re-validation* — the route must still exist and must not have
+   decayed >40% since the scanner printed it.
+3. *Generalized 10-second rule* — any leg whose quotes vanish or go stale
+   fails the attempt; filled legs unwind in strict reverse order.
+4. *Mid-flight abandonment* — before each leg the sequencer re-prices the
+   remainder; if projected completion is negative AND worse than the
+   unwind cost, the cycle is abandoned mid-route instead of completed.
+5. *Partial-fill settlement* — the cycle size is the running minimum of
+   filled legs; residual cross-venue imbalance is settled at market, and
+   perp hedges carried through conversions are closed flat.
+
+**Gates** (in the executor Core, before any capital moves): routes
+enabled, armed, fresh quotes (≤6 s), expectation = profit × quality ×
+learned capture ≥ `route_min_profit_usd` (default $2), not on cooldown,
+per-venue capital at the sized amount (segregated, sized down to what the
+tightest venue affords), and the pre-fire theoretical-bounds check. Live
+mode runs no route cycles until every leg's venue has a live gateway — a
+paper leg inside a live attempt is forbidden.
+
+**Accounting** — a banked cycle books its round trip into the trade
+blotter with per-leg detail (`Trade.legs`), the capture ratio
+(realized ÷ signal-at-fired-size) feeds the route calibration EWMA, and
+`ExecStats` carries `route_attempts / route_banked / route_profit_usd`.
+The UI keeps it simple: one ROUTES toggle in the taker bar, two meters,
+per-route quality chips and a single **TAKE THIS ROUTE** button.
+
 ## Route-capture calibration (`calib.rs`)
 
 Every venue pair has its own reality — quote flicker, leg latency, depth

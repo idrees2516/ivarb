@@ -5,6 +5,7 @@ mod app;
 mod chart;
 mod fmt;
 mod sections;
+mod sidepanel;
 mod state;
 
 fn main() {
