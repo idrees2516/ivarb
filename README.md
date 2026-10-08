@@ -105,6 +105,10 @@ fees.
 docker compose up -d                     # http://localhost:3000
 curl -s localhost:3000/healthz           # liveness
 curl -s localhost:3000/metrics           # Prometheus
+
+# Vercel (multi-service: container server + static WASM frontend)
+# import the repo on vercel.com — the root vercel.json defines both
+# services and the public routing; nothing else to configure
 ```
 
 Configuration is environment-driven with sane defaults — see
@@ -132,7 +136,7 @@ arming procedure.
 | [docs/EXECUTION.md](docs/EXECUTION.md) | The advantage taker: risk gates, state machines, sizing math, exits, hedging, calibration, live path |
 | [docs/STRATEGY.md](docs/STRATEGY.md) | Edge model, time-aware tiers, EV, hold-to-expiry lab, multi-hop, genetic optimizer |
 | [docs/COSTS-AND-CAPITAL.md](docs/COSTS-AND-CAPITAL.md) | Comprehensive cost sheets, margin formulas, funding rails, capital requirements, profit attribution |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, compose, systemd, env reference, monitoring, ops runbook |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, compose, systemd, Vercel multi-service, env reference, monitoring, ops runbook |
 | [docs/API.md](docs/API.md) | REST + WebSocket reference |
 | [docs/LIVE-TRADING.md](docs/LIVE-TRADING.md) | Real-venue gateways (Deribit/Bybit/OKX/Binance) + on-chain EVM/Uniswap execution: setup, safety model, verification |
 

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "server": {
+      "root": ".",
+      "runtime": "container"
+    },
+    "frontend": {
+      "root": "frontend",
+      "buildCommand": "bash vercel-build.sh",
+      "outputDirectory": "dist"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": { "service": "server" } },
+    { "source": "/ws", "destination": { "service": "server" } },
+    { "source": "/healthz", "destination": { "service": "server" } },
+    { "source": "/metrics", "destination": { "service": "server" } },
+    { "source": "/(.*)", "destination": { "service": "frontend" } }
+  ]
+}
