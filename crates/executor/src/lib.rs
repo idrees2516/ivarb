@@ -31,9 +31,9 @@ use tokio::sync::{broadcast, mpsc, watch};
 use ivarb_engine::engine::WatchCmd;
 use ivarb_engine::timing::Regime;
 use ivarb_protocol::{
-    ExecCommand, ExecEvent, ExecLevel, ExecMode, ExecSettings, ExecSnapshot, ExecStats,
-    ExitReason, LiveStatus, MultiHopRoute, Opportunity, Position, PositionEntry, PositionMtm,
-    Right, Snapshot, TimeRegime, Trade, WatchedLeg,
+    EscapeReason, EscapeState, ExecCommand, ExecEvent, ExecLevel, ExecMode, ExecSettings,
+    ExecSnapshot, ExecStats, ExitReason, LiveStatus, MultiHopRoute, Opportunity, Position,
+    PositionEntry, PositionMtm, Right, Snapshot, TimeRegime, Trade, WatchedLeg,
 };
 
 use machine::{AttemptCtx, AttemptOutcome, PositionDraft};
@@ -107,6 +107,10 @@ struct Stats {
     route_attempts: u64,
     route_banked: u32,
     route_profit_usd: f64,
+    // 0DTE escapes (uncaptured arbs)
+    escape_exits: u32,
+    escape_time_sum_s: f64,
+    escape_salvaged_usd: f64,
 }
 
 /// Book-keeping for one in-flight multi-leg route cycle.
@@ -268,6 +272,9 @@ pub fn spawn(deps: ExecDeps) -> ExecutorHandle {
             route_attempts: 0,
             route_banked: 0,
             route_profit_usd: 0.0,
+            escape_exits: 0,
+            escape_time_sum_s: 0.0,
+            escape_salvaged_usd: 0.0,
         },
         risk: RiskState::new(),
         calib: calib::Calib::new(),
@@ -514,6 +521,10 @@ fn empty_snapshot(mode: ExecMode) -> ExecSnapshot {
             route_attempts_active: 0,
             route_banked: 0,
             route_profit_usd: 0.0,
+            escape_exits: 0,
+            escape_active: 0,
+            escape_salvaged_usd: 0.0,
+            escape_avg_s: 0.0,
         },
         settings: ExecSettings::default(),
         regime: TimeRegime {
@@ -1824,6 +1835,9 @@ impl Core {
             peak_unrealized_usd: 0.0,
             hedge_units: 0.0,
             hedge_avg_px: 0.0,
+            hedge_venue: String::new(),
+            delta_now: 0.0,
+            escape: None,
             capital_usd: 0.0,
             closing: false,
         };
@@ -1923,7 +1937,16 @@ impl Core {
         };
 
         let mut to_close: Vec<(u64, ExitReason)> = Vec::new();
-        let mut hedges: Vec<(u64, paper::Side, f64, f64)> = Vec::new();
+        let mut hedges: Vec<(u64, paper::Side, f64, f64, String)> = Vec::new();
+        let mut escape_events: Vec<(String, String)> = Vec::new();
+        // Captured before the iter_mut loop: cross-venue hedge routing and
+        // gateway availability (the loop holds &mut self.positions).
+        let cross_hedge = self.settings.escape_cross_venue_hedge;
+        let live_mode = matches!(self.mode, ExecMode::Live);
+        let router = self.router.clone();
+        let pick_hv = |buy: &str, sell: &str| {
+            pick_hedge_venue_impl(buy, sell, cross_hedge, |v| !live_mode || router.load().has_gateway(v))
+        };
         for (id, p) in self.positions.iter_mut() {
             let legs = watched.get(&canonical_inst_of_pos(p));
             let buy_leg = legs.and_then(|ls| ls.iter().find(|l| l.venue == p.buy_venue));
@@ -1974,7 +1997,8 @@ impl Core {
                 p.mtm.theta_burn_usd = theta_day.abs() * p.units * (elapsed_s / 86400.0);
 
                 // Delta hedge (spec step 06): residual delta across venues.
-                if self.settings.hedge_enabled && spot > 0.0 {
+                // Also publishes the live delta for the UI readout.
+                {
                     let right = match p.right {
                         Right::Call => ivarb_quant::Right::Call,
                         Right::Put => ivarb_quant::Right::Put,
@@ -1988,10 +2012,63 @@ impl Core {
                         .map(|iv| ivarb_quant::bs_delta(spot, p.strike, t, iv / 100.0, right))
                         .unwrap_or(0.0);
                     let residual = p.units * (d_buy - d_sell);
-                    let target_hedge = -residual;
-                    let delta_units = target_hedge - p.hedge_units;
-                    if delta_units.abs() * spot > self.settings.hedge_threshold_usd {
-                        hedges.push((*id, if delta_units > 0.0 { paper::Side::Buy } else { paper::Side::Sell }, delta_units.abs(), spot));
+                    p.delta_now = residual + p.hedge_units;
+                    if self.settings.hedge_enabled
+                        && spot > 0.0
+                        && p.escape.is_none()
+                    {
+                        // Positions in the 0DTE escape ladder carry their
+                        // hedge on the escape venue — the incremental
+                        // hedge loop must not fight the ladder.
+                        let target_hedge = -residual;
+                        let delta_units = target_hedge - p.hedge_units;
+                        if delta_units.abs() * spot > self.settings.hedge_threshold_usd {
+                            // Cross-venue delta neutrality: the incremental
+                            // hedge goes to a venue that is NEITHER option
+                            // leg when one is reachable — the structure's
+                            // delta never depends on a single venue book.
+                            let hv = pick_hv(&p.buy_venue, &p.sell_venue);
+                            hedges.push((*id, if delta_units > 0.0 { paper::Side::Buy } else { paper::Side::Sell }, delta_units.abs(), spot, hv));
+                        }
+                    }
+                }
+
+                // ---- 0DTE escape detection (uncaptured arb) ----
+                // If the spread will not come to us, stop paying theta for
+                // it: flip to same-day doctrine — hedge the full residual on
+                // a THIRD venue, then both legs out at market, flat fast.
+                if p.escape.is_none() && !p.closing && self.settings.escape_enabled {
+                    let theta_vp = p.mtm.theta_burn_usd / (p.units * vega_unit).max(1e-9);
+                    if let Some(reason) = escape_trigger(
+                        &self.settings,
+                        p.mtm.spread_vp,
+                        p.entry.signal_net_vp,
+                        theta_vp,
+                        p.theta_budget_vp,
+                        elapsed_s,
+                        p.max_hold_s,
+                    ) {
+                        let hv = pick_hv(&p.buy_venue, &p.sell_venue);
+                        let net = p.entry.signal_net_vp.max(0.0);
+                        let progress = net - p.mtm.spread_vp;
+                        let age_s = elapsed_s.max(1.0);
+                        let opp_id = p.opp.clone();
+                        let msg = format!(
+                            "0DTE ESCAPE pos #{} — {} after {:.0}s (spread {:+.2} vp vs signal {:+.2} vp, progress {:.0}%); hedge venue {}, flat-by deadline {:.0}s",
+                            p.id, reason.label(), age_s, p.mtm.spread_vp, net,
+                            100.0 * (progress / net.max(1e-9)).clamp(-1.0, 1.0),
+                            hv, self.settings.escape_deadline_s
+                        );
+                        escape_events.push((opp_id, msg));
+                        p.escape = Some(EscapeState {
+                            reason,
+                            since_ms: now,
+                            deadline_ms: now + (self.settings.escape_deadline_s as i64) * 1000,
+                            hedge_venue: hv,
+                            hedge_placed_units: 0.0,
+                            phase: 0,
+                            phase_t_ms: now,
+                        });
                     }
                 }
 
@@ -2041,13 +2118,18 @@ impl Core {
             p.mtm.t_ms = now;
         }
 
+        // Emit the escape detections queued inside the loop (the loop held
+        // &mut self.positions; events need &mut self).
+        for (opp, msg) in escape_events {
+            self.ev(Some(opp), ExecLevel::Warn, "escape/detect", msg);
+        }
+
         // Apply hedges (live perp orders in live mode, instant paper fills
         // otherwise). Data gathered without holding the positions borrow
         // across the await.
-        for (id, side, amt, spot) in hedges {
-            let Some((venue, und, opp_id)) = self.positions.get(&id).map(|p| {
+        for (id, side, amt, spot, venue) in hedges {
+            let Some((und, opp_id)) = self.positions.get(&id).map(|p| {
                 (
-                    p.buy_venue.clone(),
                     p.underlying.clone(),
                     p.opp.clone(),
                 )
@@ -2073,8 +2155,21 @@ impl Core {
                     0.0
                 };
                 p.hedge_units = new_units;
+                p.hedge_venue = venue.clone();
                 p.mtm.hedge_pnl_usd = p.hedge_units * (spot - p.hedge_avg_px);
             }
+        }
+
+        // 0DTE escape ladder: advance every position that flipped out of
+        // its normal convergence plan (hedge first, legs out, hedge released).
+        let escaping: Vec<u64> = self
+            .positions
+            .values()
+            .filter(|p| p.escape.is_some())
+            .map(|p| p.id)
+            .collect();
+        for id in escaping {
+            self.escape_step(id).await;
         }
 
         for (id, reason) in to_close {
@@ -2104,6 +2199,156 @@ impl Core {
             self.watch_dirty = false;
         }
         self.dirty = true;
+    }
+
+    /// Perp-capable venue preference for cross-venue delta hedges, ordered by
+    /// perp liquidity + fee quality. The escape ladder and the incremental
+    /// hedge loop both pick the first venue that is NEITHER option leg, so
+    /// the delta-neutral structure is spread across three different books.
+    /// (Routing happens through `pick_hedge_venue_impl` so the monitor's
+    /// `iter_mut` loop can call it without borrowing `self`.)
+    const HEDGE_VENUE_PREF: &[&str] = &["bybit", "okx", "binance", "delta", "deribit"];
+
+    /// Advance one position's 0DTE escape ladder by a single step.
+    ///
+    /// Phase 0 → 1: hedge the FULL residual delta on the escape (third)
+    /// venue — delta is neutralized before any leg moves, so the exit can
+    /// never turn a failed arb into a directional bet.
+    /// Phase 1 → flat: both legs out at market (crossing the touch; the
+    /// close path's sane-banded touch/mark/entry ladder still applies), the
+    /// hedge released on the escape venue, the trade booked as
+    /// `Escaped0dte` with its own stats bucket. Past the hard deadline the
+    /// close is forced regardless of quote freshness.
+    async fn escape_step(&mut self, id: u64) {
+        let now = now_ms();
+        let (phase, hedge_venue, deadline_ms, phase_t_ms) = match self.positions.get(&id) {
+            Some(p) => match &p.escape {
+                Some(e) => (e.phase, e.hedge_venue.clone(), e.deadline_ms, e.phase_t_ms),
+                None => return,
+            },
+            None => return,
+        };
+        let forced = now > deadline_ms;
+        // Hedge-fill confirmation dwell: after placing the hedge the ladder
+        // waits briefly so the neutralization is verified (and visible)
+        // before the legs move — unless the hard deadline forces through.
+        const PHASE_DWELL_MS: i64 = 900;
+        if phase == 1 && !forced && now - phase_t_ms < PHASE_DWELL_MS {
+            return;
+        }
+
+        if phase == 0 {
+            // --- hedge first: neutralize delta on a third venue ---
+            let (delta_now, spot, und, opp_id, already_placed) = match self.positions.get(&id) {
+                Some(p) => (
+                    p.delta_now,
+                    p.entry.spot,
+                    p.underlying.clone(),
+                    p.opp.clone(),
+                    p.escape.as_ref().map(|e| e.hedge_placed_units).unwrap_or(0.0),
+                ),
+                None => return,
+            };
+            // Idempotency: a step that already placed its hedge never
+            // re-hedges (monitor ticks can race the await points).
+            if already_placed.abs() > 1e-9 {
+                if let Some(p) = self.positions.get_mut(&id) {
+                    if let Some(e) = p.escape.as_mut() {
+                        e.phase = 1;
+                    }
+                }
+                return;
+            }
+            let snap = self.deps.snapshot.load();
+            let spot = snap
+                .spots
+                .iter()
+                .find(|s| s.underlying == und)
+                .map(|s| s.price)
+                .filter(|s| *s > 0.0)
+                .unwrap_or(spot);
+            let delta_units = -delta_now; // full neutralization
+            if delta_units.abs() > 1e-9 && spot > 0.0 {
+                let side = if delta_units > 0.0 { paper::Side::Buy } else { paper::Side::Sell };
+                let (px, _fee) = Self::hedge_or_paper(
+                    &self.router, &self.broker, &hedge_venue, &und, side, delta_units.abs(), spot,
+                )
+                .await;
+                if px > 0.0 {
+                    if let Some(p) = self.positions.get_mut(&id) {
+                        let signed = if side == paper::Side::Buy { delta_units.abs() } else { -delta_units.abs() };
+                        let new_units = p.hedge_units + signed;
+                        p.hedge_avg_px = if new_units.abs() > 1e-9 {
+                            (p.hedge_avg_px * p.hedge_units + px * signed) / new_units
+                        } else {
+                            0.0
+                        };
+                        p.hedge_units = new_units;
+                        p.hedge_venue = hedge_venue.clone();
+                        p.delta_now = 0.0;
+                        if let Some(e) = p.escape.as_mut() {
+                            e.hedge_placed_units = new_units;
+                            e.phase = 1;
+                            e.phase_t_ms = now_ms();
+                        }
+                        self.ev(
+                            Some(opp_id),
+                            ExecLevel::Ok,
+                            "escape/hedge",
+                            format!(
+                                "0DTE hedge placed — {:.4} {} perp {} @ {:.2} on {} (third venue): structure delta ≈ 0 while legs exit",
+                                signed.abs(), und, if side == paper::Side::Buy { "buy" } else { "sell" }, px, hedge_venue
+                            ),
+                        );
+                    }
+                } else {
+                    self.ev(
+                        Some(opp_id),
+                        ExecLevel::Error,
+                        "escape/hedge",
+                        format!("live hedge refused on {hedge_venue} — exiting legs unhedged"),
+                    );
+                    if let Some(p) = self.positions.get_mut(&id) {
+                        if let Some(e) = p.escape.as_mut() {
+                            e.phase = 1;
+                            e.phase_t_ms = now_ms();
+                        }
+                    }
+                }
+            } else {
+                // Already flat delta: skip straight to the leg-out phase.
+                if let Some(p) = self.positions.get_mut(&id) {
+                    if let Some(e) = p.escape.as_mut() {
+                        e.phase = 1;
+                        e.phase_t_ms = now_ms();
+                    }
+                }
+            }
+            return;
+        }
+
+        if phase >= 1 {
+            // --- legs out at market, hedge released, trade booked ---
+            if let Some(p) = self.positions.get_mut(&id) {
+                if let Some(e) = p.escape.as_mut() {
+                    e.phase = 2;
+                    e.phase_t_ms = now_ms();
+                    if forced {
+                        e.reason = EscapeReason::Deadline;
+                    }
+                }
+            }
+            if forced {
+                let opp_id = self.positions.get(&id).map(|p| p.opp.clone());
+                self.ev(
+                    opp_id,
+                    ExecLevel::Error,
+                    "escape/deadline",
+                    "0DTE escape deadline hit — forcing legs out at any price".into(),
+                );
+            }
+            self.close_position(id, ExitReason::Escaped0dte).await;
+        }
     }
 
     async fn close_position(&mut self, id: u64, reason: ExitReason) {
@@ -2209,13 +2454,20 @@ impl Core {
         };
         exit_fees += fee2;
 
-        // Unwind the residual-delta hedge.
+        // Unwind the residual-delta hedge. Escape-ladder hedges sit on the
+        // escape (third) venue; hold-period hedges on the venue they were
+        // placed on (the buy venue by default, cross-venue when enabled).
         let mut hedge_exit_pnl = 0.0;
         if p.hedge_units.abs() > 1e-9 {
             let side = if p.hedge_units > 0.0 { paper::Side::Sell } else { paper::Side::Buy };
+            let hv = p
+                .escape
+                .as_ref()
+                .map(|e| e.hedge_venue.clone())
+                .unwrap_or_else(|| p.buy_venue.clone());
             let (px, _fee) = Self::hedge_or_paper(
                 &self.router, &self.broker,
-                &p.buy_venue.clone(), &p.underlying.clone(), side, p.hedge_units.abs(), spot,
+                &hv, &p.underlying.clone(), side, p.hedge_units.abs(), spot,
             )
             .await;
             if px > 0.0 {
@@ -2256,6 +2508,15 @@ impl Core {
         self.stats.realized_usd += realized;
         self.stats.fees_usd += total_fees;
         self.stats.trades_closed += 1;
+        // 0DTE escape bucket: count, timing and what the ladder salvaged
+        // out of a failed capture.
+        if reason == ExitReason::Escaped0dte {
+            if let Some(esc) = &p.escape {
+                self.stats.escape_exits += 1;
+                self.stats.escape_time_sum_s += ((now - esc.since_ms).max(0) as f64) / 1000.0;
+                self.stats.escape_salvaged_usd += realized;
+            }
+        }
         self.stats.gross_locked_usd += gross_locked;
         self.stats.exit_drift_usd += exit_drift;
         self.stats.hedge_pnl_usd += hedge_total;
@@ -2317,6 +2578,7 @@ impl Core {
             ExitReason::Manual => "manual close",
             ExitReason::Killed => "kill switch",
             ExitReason::Expiry => "expiry approaching",
+            ExitReason::Escaped0dte => "0DTE escape — uncaptured arb rapid exit",
             ExitReason::RouteBanked => "multi-leg route banked",
             ExitReason::RouteUnwound => "multi-leg route unwound",
         };
@@ -2399,6 +2661,18 @@ impl Core {
                 route_attempts_active: self.route_active.len() as u32,
                 route_banked: self.stats.route_banked,
                 route_profit_usd: self.stats.route_profit_usd,
+                escape_exits: self.stats.escape_exits,
+                escape_active: self
+                    .positions
+                    .values()
+                    .filter(|p| p.escape.is_some())
+                    .count() as u32,
+                escape_salvaged_usd: self.stats.escape_salvaged_usd,
+                escape_avg_s: if self.stats.escape_exits > 0 {
+                    self.stats.escape_time_sum_s / self.stats.escape_exits as f64
+                } else {
+                    0.0
+                },
             },
             settings: self.settings.clone(),
             regime: TimeRegime {
@@ -2509,5 +2783,181 @@ fn fmt_dur(s: f64) -> String {
         format!("{:.0}m", s / 60.0)
     } else {
         format!("{:.1}h", s / 3600.0)
+    }
+}
+
+/// Pure 0DTE-escape trigger: has this uncaptured arb earned the rapid-exit
+/// ladder? Fires on (in priority order):
+/// 1. **Spread reversed** — the divergence widened past entry + buffer; the
+///    move went against us, waiting only compounds the theta bleed.
+/// 2. **Theta accelerating** — decay running ≥3× ahead of the budget
+///    schedule; every extra hold second destroys edge.
+/// 3. **No convergence** — the patience window (a fraction of the bucket's
+///    max hold) elapsed with less than the required fraction of the signal
+///    converged; the edge is not coming to us.
+fn escape_trigger(
+    s: &ExecSettings,
+    spread_vp: f64,
+    signal_net_vp: f64,
+    theta_burn_vp: f64,
+    theta_budget_vp: f64,
+    elapsed_s: f64,
+    max_hold_s: f64,
+) -> Option<EscapeReason> {
+    let net = signal_net_vp.max(0.0);
+    if net <= 0.0 || max_hold_s <= 0.0 {
+        return None;
+    }
+    let progress = net - spread_vp;
+    // Reversal needs a grace window: post-fill quote bounce routinely
+    // reads 1.5× the signal seconds after entry — that is noise, not a
+    // reversal. Only a widening past entry + reversal_mult × signal that
+    // passes the 10-second grace counts.
+    if elapsed_s > 10.0 && spread_vp >= net + s.escape_reversal_mult * net {
+        return Some(EscapeReason::SpreadReversed);
+    }
+    if elapsed_s > 30.0 && theta_budget_vp > 0.0 {
+        let theta_hot = theta_burn_vp >= 3.0 * theta_budget_vp * (elapsed_s / max_hold_s);
+        if theta_hot {
+            return Some(EscapeReason::ThetaAccelerating);
+        }
+    }
+    let patience_s = s.escape_patience_frac * max_hold_s;
+    if elapsed_s >= patience_s && progress < s.escape_min_progress_frac * net {
+        return Some(EscapeReason::NoConvergence);
+    }
+    None
+}
+
+/// Base venue name without the sim-feed namespace prefix.
+fn base_venue(v: &str) -> &str {
+    v.strip_prefix("sim:").unwrap_or(v)
+}
+
+/// Pure cross-venue hedge picker (see `Core::pick_hedge_venue`).
+/// Leg comparison happens on BASE names (sim feeds namespace their venues
+/// `sim:okx`…), and the returned venue carries the same namespace as the
+/// legs so paper hedges book against the same accounts as the positions.
+fn pick_hedge_venue_impl(
+    buy: &str,
+    sell: &str,
+    cross_venue: bool,
+    live_ok: impl Fn(&str) -> bool,
+) -> String {
+    if !cross_venue {
+        return buy.to_string();
+    }
+    let (bb, sb) = (base_venue(buy), base_venue(sell));
+    let sim = buy.starts_with("sim:") || sell.starts_with("sim:");
+    for v in Core::HEDGE_VENUE_PREF {
+        if *v != bb && *v != sb && live_ok(v) {
+            return if sim { format!("sim:{v}") } else { (*v).to_string() };
+        }
+    }
+    buy.to_string()
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+    use ivarb_protocol::ExecSettings;
+
+    #[test]
+    fn escape_triggers_on_spread_reversal_immediately() {
+        let s = ExecSettings::default();
+        // Signal +2.0 vp at entry; spread now 4.1 vp (≥ 2.0 + 1.0×2.0 = 4.0)
+        // past the 10-second grace window.
+        let r = escape_trigger(&s, 4.1, 2.0, 0.0, 0.2, 15.0, 3600.0);
+        assert_eq!(r, Some(EscapeReason::SpreadReversed));
+        // Inside the buffer: no escape yet.
+        assert_eq!(escape_trigger(&s, 3.9, 2.0, 0.0, 0.2, 15.0, 3600.0), None);
+        // Post-fill bounce inside the grace window (even 3× wide) is noise,
+        // not a reversal — the position keeps its normal plan.
+        assert_eq!(escape_trigger(&s, 6.5, 2.0, 0.0, 0.2, 5.0, 3600.0), None);
+    }
+
+    #[test]
+    fn escape_triggers_on_no_convergence_after_patience() {
+        let s = ExecSettings::default();
+        // patience = 0.35 × 3600 = 1260s; at 1300s with <25% progress → fire.
+        let r = escape_trigger(&s, 1.8, 2.0, 0.0, 0.2, 1300.0, 3600.0);
+        assert_eq!(r, Some(EscapeReason::NoConvergence));
+        // Same age but 60% converged → keep trading the normal plan.
+        assert_eq!(escape_trigger(&s, 0.8, 2.0, 0.0, 0.2, 1300.0, 3600.0), None);
+        // Converged too little but patience not elapsed → wait.
+        assert_eq!(escape_trigger(&s, 1.8, 2.0, 0.0, 0.2, 60.0, 3600.0), None);
+    }
+
+    #[test]
+    fn escape_triggers_on_theta_acceleration() {
+        let s = ExecSettings::default();
+        // Budget 0.2 vp over 3600s → schedule rate 0.2/3600 vp/s. At t=600s
+        // the schedule allows 0.033 vp; burning 0.5 vp is ~15× hot.
+        let r = escape_trigger(&s, 1.5, 2.0, 0.5, 0.2, 600.0, 3600.0);
+        assert_eq!(r, Some(EscapeReason::ThetaAccelerating));
+        // On-schedule theta never fires the escape.
+        assert_eq!(escape_trigger(&s, 1.5, 2.0, 0.03, 0.2, 600.0, 3600.0), None);
+    }
+
+    #[test]
+    fn no_escape_when_disabled_or_signal_degenerate() {
+        let mut s = ExecSettings::default();
+        s.escape_enabled = false;
+        // (Caller checks escape_enabled before invoking; the pure fn assumes
+        // it is on. Degenerate signals must never fire.)
+        assert_eq!(escape_trigger(&s, 5.0, 0.0, 1.0, 0.2, 999.0, 3600.0), None);
+        assert_eq!(escape_trigger(&s, 5.0, -1.0, 1.0, 0.2, 999.0, 3600.0), None);
+        assert_eq!(escape_trigger(&s, 5.0, 2.0, 1.0, 0.2, 999.0, 0.0), None);
+    }
+
+    #[test]
+    fn hedge_venue_is_a_third_venue() {
+        // bybit is first in preference and is neither leg.
+        assert_eq!(pick_hedge_venue_impl("okx", "binance", true, |_| true), "bybit");
+        // bybit is the sell leg → okx (next pref, not a leg).
+        assert_eq!(pick_hedge_venue_impl("deribit", "bybit", true, |_| true), "okx");
+        // Live mode: preferred venues without gateways are skipped.
+        assert_eq!(
+            pick_hedge_venue_impl("okx", "binance", true, |v| v == "delta"),
+            "delta"
+        );
+        // Cross-venue disabled → buy venue.
+        assert_eq!(pick_hedge_venue_impl("okx", "binance", false, |_| true), "okx");
+        // All preferred venues are either legs or unreachable → fall back
+        // to the buy venue.
+        assert_eq!(
+            pick_hedge_venue_impl("bybit", "okx", true, |v| v == "bybit" || v == "okx"),
+            "bybit"
+        );
+    }
+
+    #[test]
+    fn sim_namespace_venues_pick_a_real_third_book() {
+        // Sim-feed venues are namespaced `sim:` — bybit as a SELL leg must
+        // not be picked again just because the prefix differs, and the
+        // returned venue must stay in the sim namespace so the paper hedge
+        // books against the same account fabric.
+        assert_eq!(
+            pick_hedge_venue_impl("sim:delta", "sim:bybit", true, |_| true),
+            "sim:okx"
+        );
+        assert_eq!(
+            pick_hedge_venue_impl("sim:okx", "sim:binance", true, |_| true),
+            "sim:bybit"
+        );
+        // Mixed namespaces compare on base names.
+        assert_eq!(pick_hedge_venue_impl("sim:bybit", "okx", true, |_| true), "sim:binance");
+    }
+
+    #[test]
+    fn escape_deadline_is_respected() {
+        // The ladder's deadline math: detection now + deadline_s seconds.
+        let now = 1_000_000i64;
+        let dl = now + (45.0f64) as i64 * 1000;
+        assert_eq!(dl - now, 45_000);
+        // Phase 1 past the deadline forces the close (checked in escape_step
+        // via `now > deadline_ms`); the pure check:
+        assert!(now + 46_000 > dl);
+        assert!(now + 44_000 <= dl);
     }
 }

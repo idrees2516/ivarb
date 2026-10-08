@@ -93,6 +93,10 @@ pub fn SidePanel() -> impl IntoView {
                         <SpStat label="routes banked" value=e.stats.route_banked.to_string() cls=""/>
                         <SpStat label="route P&L" value=fmt::fmt_usd(e.stats.route_profit_usd)
                             cls={if e.stats.route_profit_usd >= 0.0 { "pos" } else { "neg" }}/>
+                        <SpStat label="0DTE escapes" value=format!("{} · {} live", e.stats.escape_exits, e.stats.escape_active)
+                            cls={if e.stats.escape_active > 0 { "neg" } else { "" }}/>
+                        <SpStat label="escape salvaged" value=fmt::fmt_usd(e.stats.escape_salvaged_usd)
+                            cls={if e.stats.escape_salvaged_usd >= 0.0 { "pos" } else { "neg" }}/>
                         <SpStat label="vega" value=format!("{} / {}", fmt::fmt_usd(e.stats.vega_used_usd), fmt::fmt_usd(e.settings.max_total_vega_usd)) cls=""/>
                         <SpStat label="capture" value={if e.stats.trades_closed > 0 { format!("{:.0}%", e.stats.capture_ratio * 100.0) } else { "—".into() }} cls=""/>
                     }.into_any(),

@@ -35,6 +35,7 @@ pub fn TakerSection() -> impl IntoView {
                     let s6 = s.clone();
                     view! {
                         <ControlBar s=s.clone()/>
+                        <EscapePanel s=s.clone()/>
                         <div class="taker-grid">
                             <div class="tk-col">
                                 <PositionsPanel s=s2.clone()/>
@@ -62,6 +63,7 @@ fn ControlBar(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
     let st_reset = st.clone();
     let st_flat = st.clone();
     let st_routes = st.clone();
+    let st_escape = st.clone();
     let s1 = s.clone();
     let s2 = s.clone();
     let s3 = s.clone();
@@ -70,6 +72,7 @@ fn ControlBar(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
     let s6 = s.clone();
     let s7 = s.clone();
     let s8 = s.clone();
+    let s9 = s.clone();
 
     let mode_label = match s.stats.mode {
         ExecMode::Paper => "PAPER",
@@ -145,6 +148,30 @@ fn ControlBar(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
                         </button>
                     }.into_any()
                 }}
+                {if s9.settings.escape_enabled {
+                    view! {
+                        <button class="tb-btn escape on"
+                            title="0DTE escape: uncaptured arbs flip to same-day doctrine — hedge on a third venue, legs out at market, flat fast"
+                            on:click=move |_| {
+                                let mut set = s9.settings.clone();
+                                set.escape_enabled = false;
+                                st_escape.send_exec_cmd(ExecCommand::UpdateSettings { settings: set }, "0DTE escape OFF — failed captures trade their normal exit ladder".into())
+                            }>
+                            "⟁ 0DTE ESCAPE ON"
+                        </button>
+                    }.into_any()
+                } else {
+                    view! {
+                        <button class="tb-btn escape off"
+                            on:click=move |_| {
+                                let mut set = s9.settings.clone();
+                                set.escape_enabled = true;
+                                st_escape.send_exec_cmd(ExecCommand::UpdateSettings { settings: set }, "0DTE escape ARMED — uncaptured arbs will rapid-exit delta-neutral".into())
+                            }>
+                            "⟁ 0DTE ESCAPE OFF"
+                        </button>
+                    }.into_any()
+                }}
                 <button class="tb-btn flat"
                     on:click=move |_| st_flat.send_exec_cmd(ExecCommand::FlattenAll, "flatten-all requested".into())>
                     "FLATTEN ALL"
@@ -174,10 +201,134 @@ fn ControlBar(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
                 <Meter label="single-leg events" value=s6.stats.single_leg_events.to_string()
                     class_extra={if s6.stats.single_leg_events > 0 { "neg" } else { "" }}/>
                 <Meter label="capture ratio" value={if s6.stats.trades_closed > 0 { format!("{:.0}% of signal", s6.stats.capture_ratio * 100.0) } else { "—".into() }} class_extra=""/>
+                <Meter label="0DTE escapes" value=format!("{} · {} live", s6.stats.escape_exits, s6.stats.escape_active)
+                    class_extra={if s6.stats.escape_active > 0 { "neg" } else if s6.stats.escape_exits > 0 { "" } else { "" }}/>
+                <Meter label="escape salvaged" value=fmt::fmt_usd(s6.stats.escape_salvaged_usd)
+                    class_extra={if s6.stats.escape_salvaged_usd >= 0.0 { "pos" } else { "neg" }}/>
+                <Meter label="escape speed" value={if s6.stats.escape_exits > 0 { format!("{:.0}s to flat", s6.stats.escape_avg_s) } else { "—".into() }} class_extra=""/>
             </div>
         </div>
         {move || st.flash.get().map(|f| view! { <div class="flash">{f}</div> }.into_any())}
     }
+}
+
+/// The 0DTE escape control surface: doctrine, live ladder map, portfolio
+/// delta readout and salvage stats.
+///
+/// When an arb is NOT captured (spread stalls or reverses), the position
+/// flips to same-day doctrine: hedge the full residual delta on a THIRD
+/// venue first, then both legs out at market, hedge released — flat within
+/// the deadline. The legs and the hedge deliberately sit on three different
+/// venue books, so the structure stays delta-neutral no matter which single
+/// venue gaps during the exit.
+#[component]
+fn EscapePanel(s: ivarb_protocol::ExecSnapshot) -> impl IntoView {
+    let escaping: Vec<Position> = s.positions.iter().filter(|p| p.escape.is_some()).cloned().collect();
+    let portfolio_delta: f64 = s.positions.iter().map(|p| p.delta_now).sum();
+    let now = st_now();
+    let stats = s.stats.clone();
+    let enabled = s.settings.escape_enabled;
+    view! {
+        <div class=move || format!("esc-panel {}", if enabled { "on" } else { "off" })>
+            <div class="esc-head">
+                <div class="esc-title">
+                    <span class="esc-icon">"⟁"</span>
+                    <div>
+                        <h3>"0DTE escape — uncaptured-arb rapid exit"</h3>
+                        <p>"When a taken arb will not converge, stop paying theta for it: hedge the full delta on a third venue, then both legs out at market, flat within the deadline. The exit never turns a failed arb into a directional bet."</p>
+                    </div>
+                </div>
+                <div class="esc-stats">
+                    <div class="esc-stat">
+                        <span class="escs-l">"escapes"</span>
+                        <span class="escs-v">{format!("{} · {} live", stats.escape_exits, stats.escape_active)}</span>
+                    </div>
+                    <div class="esc-stat">
+                        <span class="escs-l">"salvaged"</span>
+                        <span class=move || format!("escs-v {}", if stats.escape_salvaged_usd >= 0.0 { "pos" } else { "neg" })>
+                            {fmt::fmt_usd(stats.escape_salvaged_usd)}
+                        </span>
+                    </div>
+                    <div class="esc-stat">
+                        <span class="escs-l">"avg to flat"</span>
+                        <span class="escs-v">{if stats.escape_exits > 0 { format!("{:.0}s", stats.escape_avg_s) } else { "—".into() }}</span>
+                    </div>
+                    <div class="esc-stat">
+                        <span class="escs-l">"portfolio Δ"</span>
+                        <span class=move || format!("escs-v {}", if portfolio_delta.abs() < 0.05 { "neutral" } else { "warn" })
+                            title="sum of live structure deltas (options + hedges) across all open positions">
+                            {format!("{:+.3}", portfolio_delta)}
+                        </span>
+                    </div>
+                </div>
+            </div>
+            {move || if !enabled {
+                view! {
+                    <div class="esc-note off">"0DTE escape is OFF — failed captures will ride their normal patience/hold exit ladder instead."</div>
+                }.into_any()
+            } else if escaping.is_empty() {
+                view! {
+                    <div class="esc-note">{
+                        format!(
+                            "Armed. Detection: spread stalls below {:.0}% of the signal by {:.0}% of the hold window · spread reverses past +{:.0}% · theta runs 3× hot — any of these flips the position into the ladder below.",
+                            100.0 * s.settings.escape_min_progress_frac,
+                            100.0 * s.settings.escape_patience_frac,
+                            100.0 * s.settings.escape_reversal_mult
+                        )
+                    }</div>
+                }.into_any()
+            } else {
+                escaping.iter().map(|p| {
+                    let e = p.escape.clone().unwrap();
+                    let secs_left = ((e.deadline_ms - now).max(0) / 1000) as u64;
+                    let phase_label = match e.phase {
+                        0 => "detected",
+                        1 => "hedged — legs going out",
+                        2 => "legs out — releasing hedge",
+                        _ => "flat",
+                    };
+                    view! {
+                        <div class="esc-row escaping">
+                            <div class="esc-inst">
+                                <span class="und-chip">{p.underlying.clone()}</span>
+                                <span class="mono">{p.expiry.clone()}{" "}{fmt::fmt_strike(p.strike)}{" "}{fmt::fmt_right(&p.right)}</span>
+                                <span class="esc-reason">{e.reason.label()}</span>
+                            </div>
+                            <div class="esc-map">
+                                <span class="esc-node buy" title="long option leg">{fmt::venue_name(&p.buy_venue)}</span>
+                                <span class="esc-link">"⟷"</span>
+                                <span class="esc-node sell" title="short option leg">{fmt::venue_name(&p.sell_venue)}</span>
+                                <span class="esc-link">"+ Δ hedge on"</span>
+                                <span class="esc-node hedge" title="perp delta hedge — third venue">{fmt::venue_name(&e.hedge_venue)}</span>
+                            </div>
+                            <div class="esc-ladder">
+                                <span class=move || format!("esc-step {}", if e.phase >= 0 { "done" } else { "" })>"detect"</span>
+                                <span class="esc-sep">"→"</span>
+                                <span class=move || format!("esc-step {}", if e.phase >= 1 { "done" } else { "" })>"hedge Δ"</span>
+                                <span class="esc-sep">"→"</span>
+                                <span class=move || format!("esc-step {}", if e.phase >= 2 { "done" } else { "" })>"legs out"</span>
+                                <span class="esc-sep">"→"</span>
+                                <span class="esc-step">"flat"</span>
+                            </div>
+                            <div class="esc-meta">
+                                <span class="esc-phase">{phase_label}</span>
+                                <span class=move || format!("esc-count {}", if secs_left <= 10 { "hot" } else { "" })>
+                                    {format!("flat in ≤{}s", secs_left)}
+                                </span>
+                                <span class="esc-delta">{format!("Δ {:+.3} → 0", p.delta_now)}</span>
+                            </div>
+                        </div>
+                    }.into_any()
+                }).collect::<Vec<_>>().into_any()
+            }}
+        </div>
+    }
+}
+
+/// Current epoch ms (the side panel clock signal is not shared; the escape
+/// countdown refreshes on every exec snapshot push ~1 Hz anyway).
+fn st_now() -> i64 {
+    js_sys::Date::now() as i64
 }
 
 #[component]
@@ -239,9 +390,16 @@ fn PositionRow(p: Position, st: ApiState) -> impl IntoView {
     let p5 = p.clone();
     let p6 = p.clone();
     let p7 = p.clone();
+    let esc2 = p.escape.clone();
+    let delta = p.delta_now;
+    let now = st.now;
     let pos = p.mtm.unrealized_usd >= 0.0;
     view! {
-        <tr class=move || if p.closing { "tk-row closing" } else { "tk-row" }>
+        <tr class=move || {
+            let mut c = if p.closing { String::from("tk-row closing") } else { String::from("tk-row") };
+            if p.escape.is_some() { c.push_str(" escaping"); }
+            c
+        }>
             <td class="mono">#{p.id}</td>
             <td>
                 <div class="tk-inst">
@@ -260,11 +418,28 @@ fn PositionRow(p: Position, st: ApiState) -> impl IntoView {
             <td class="mono dim">{fmt::fmt_usd(p4.mtm.theta_burn_usd)}</td>
             <td class="mono dim">{format!("{} / {}", fmt_hold(p5.mtm.elapsed_s), fmt_hold(p6.max_hold_s))}</td>
             <td class="tk-exit">
+                {move || match esc2.clone() {
+                    Some(e) => view! {
+                        <span class="exo escape" title={format!("0DTE escape — {} — hedge venue {} · phase {}", e.reason.label(), fmt::venue_name(&e.hedge_venue), e.phase)}>
+                            {format!("⟁ 0DTE · {} · {}s left", e.reason.label(), ((e.deadline_ms - now.get()).max(0) / 1000))}
+                        </span>
+                    }.into_any(),
+                    None => ().into_any(),
+                }}
                 <span class="exo take">{format!("≤{:.2}vp", p7.exit_take_vp)}</span>
                 <span class="exo stop">{format!("{:.2}vp", p7.exit_stop_vp)}</span>
                 <span class="exo theta">{format!("θ{:.2}vp", p7.theta_budget_vp)}</span>
                 {if p.hedge_units.abs() > 1e-9 {
-                    view! { <span class="exo hedge">{format!("Δhedge {:.2}", p.hedge_units)}</span> }.into_any()
+                    view! {
+                        <span class="exo hedge"
+                            title={format!("delta hedge — structure delta {:.4} underlying units", delta)}>
+                            {if p.hedge_venue.is_empty() {
+                                format!("Δhedge {:.2}", p.hedge_units)
+                            } else {
+                                format!("Δhedge {:.2} → {}", p.hedge_units, fmt::venue_name(&p.hedge_venue))
+                            }}
+                        </span>
+                    }.into_any()
                 } else { ().into_any() }}
             </td>
             <td>
@@ -508,6 +683,7 @@ fn exit_class(r: &ExitReason) -> &'static str {
         ExitReason::TakeProfit | ExitReason::Trail | ExitReason::RouteBanked => "take",
         ExitReason::Stop | ExitReason::Killed | ExitReason::RouteUnwound => "stop",
         ExitReason::ThetaBudget => "theta",
+        ExitReason::Escaped0dte => "escape",
         _ => "neutral",
     }
 }
@@ -523,6 +699,7 @@ fn exit_label(r: &ExitReason) -> &'static str {
         ExitReason::Manual => "MANUAL",
         ExitReason::Killed => "KILLED",
         ExitReason::Expiry => "EXPIRY",
+        ExitReason::Escaped0dte => "0DTE ESCAPE",
         ExitReason::RouteBanked => "ROUTE BANKED",
         ExitReason::RouteUnwound => "ROUTE UNWOUND",
     }

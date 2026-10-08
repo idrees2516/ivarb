@@ -177,6 +177,55 @@ pub struct PositionMtm {
     pub elapsed_s: f64,
 }
 
+/// Why a live arb position flipped into 0DTE escape mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscapeReason {
+    /// Patience elapsed with less than the required convergence progress —
+    /// the edge is not coming to us, stop paying theta for it.
+    NoConvergence,
+    /// Spread widened past entry plus a buffer — the move went against us.
+    SpreadReversed,
+    /// Theta burn rate running far ahead of the budget schedule.
+    ThetaAccelerating,
+    /// Escape deadline hit with legs still open — force flat at any price.
+    Deadline,
+}
+
+impl EscapeReason {
+    pub fn label(&self) -> &'static str {
+        match self {
+            EscapeReason::NoConvergence => "no convergence",
+            EscapeReason::SpreadReversed => "spread reversed",
+            EscapeReason::ThetaAccelerating => "theta accelerating",
+            EscapeReason::Deadline => "deadline",
+        }
+    }
+}
+
+/// Live state of a position executing the 0DTE escape ladder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EscapeState {
+    pub reason: EscapeReason,
+    pub since_ms: i64,
+    /// Hard flat-by instant (ms epoch). After it, legs go out at any price.
+    pub deadline_ms: i64,
+    /// Venue carrying the delta hedge — deliberately a THIRD venue,
+    /// different from both option legs, so no single venue book can gap
+    /// the whole delta-neutral structure.
+    pub hedge_venue: VenueId,
+    /// Hedge size actually placed so far (underlying units).
+    pub hedge_placed_units: f64,
+    /// Ladder phase: 0 = detected, 1 = hedge placed, 2 = first leg out,
+    /// 3 = second leg out, 4 = hedge released / flat.
+    pub phase: u8,
+    /// When the current phase was entered (ms) — phases dwell briefly
+    /// (hedge-fill confirmation) so the structure is verifiably neutral
+    /// before the legs move, and so the ladder is observable end-to-end.
+    #[serde(default)]
+    pub phase_t_ms: i64,
+}
+
 /// A completed two-leg arbitrage position.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Position {
@@ -216,6 +265,18 @@ pub struct Position {
     /// Residual delta hedge state (spec step 06).
     pub hedge_units: f64,
     pub hedge_avg_px: f64,
+    /// Venue currently carrying the delta hedge — with cross-venue
+    /// neutrality this is typically a THIRD venue, neither option leg.
+    #[serde(default)]
+    pub hedge_venue: VenueId,
+    /// Live residual delta of the structure (options + hedge), underlying
+    /// units — published for the UI's delta-neutral readout.
+    #[serde(default)]
+    pub delta_now: f64,
+    /// 0DTE escape state — `None` while the position still trades its
+    /// normal convergence plan.
+    #[serde(default)]
+    pub escape: Option<EscapeState>,
     /// Capital reserved at entry: long premium + buffered short-leg
     /// margin + entry fees (both venues).
     pub capital_usd: f64,
@@ -268,6 +329,11 @@ pub enum ExitReason {
     Killed,
     /// Expiry approaching — forced wind-down.
     Expiry,
+    /// 0DTE escape: the arb was not captured (no convergence / reversal /
+    /// theta acceleration), so the position flipped to same-day doctrine —
+    /// hedge first on a third venue, then both legs out at market, hedge
+    /// released, flat within the escape deadline.
+    Escaped0dte,
     /// Multi-leg route cycle completed flat — cash banked.
     RouteBanked,
     /// Multi-leg route cycle broke mid-flight — unwound at a cost.
@@ -403,6 +469,21 @@ pub struct ExecStats {
     /// Cumulative realized P&L from route cycles, USD.
     #[serde(default)]
     pub route_profit_usd: f64,
+
+    // ---- 0DTE escapes (uncaptured arbs) ----
+    /// Escape ladder transitions this session (any reason).
+    #[serde(default)]
+    pub escape_exits: u32,
+    /// Positions currently executing the escape ladder.
+    #[serde(default)]
+    pub escape_active: u32,
+    /// Realized P&L booked through escape exits, USD (what the ladder
+    /// salvaged out of failed captures — can be negative on bad breaks).
+    #[serde(default)]
+    pub escape_salvaged_usd: f64,
+    /// Mean detection-to-flat time across completed escapes, seconds.
+    #[serde(default)]
+    pub escape_avg_s: f64,
 }
 
 /// User-tunable settings (all env-overridable, UI-editable at runtime).
@@ -448,6 +529,32 @@ pub struct ExecSettings {
     /// Minimum total (at-size) USD profit for a route cycle to fire.
     #[serde(default = "default_route_min_profit")]
     pub route_min_profit_usd: f64,
+    // ---- 0DTE escape (uncaptured-arb rapid exit) ----
+    /// Master switch: flip uncaptured arbs to same-day doctrine (hedge
+    /// first on a third venue, both legs out at market, flat fast).
+    #[serde(default = "default_true")]
+    pub escape_enabled: bool,
+    /// Fraction of the bucket's max-hold after which "still no
+    /// convergence" counts as a failed capture and triggers the escape.
+    #[serde(default = "default_escape_patience_frac")]
+    pub escape_patience_frac: f64,
+    /// Convergence progress (fraction of the signaled edge) required by
+    /// the patience deadline to keep trading the normal plan.
+    #[serde(default = "default_escape_min_progress_frac")]
+    pub escape_min_progress_frac: f64,
+    /// Spread widening past entry + this multiple of the signal (after a
+    /// 10-second post-fill grace window) flips the position into escape —
+    /// the move went against us.
+    #[serde(default = "default_escape_reversal_mult")]
+    pub escape_reversal_mult: f64,
+    /// Hard flat-by deadline for the escape ladder, seconds from detection.
+    #[serde(default = "default_escape_deadline_s")]
+    pub escape_deadline_s: f64,
+    /// Place escape hedges on a venue DIFFERENT from both option legs
+    /// (cross-venue delta neutrality). Falls back to the buy venue when
+    /// no third perp-capable venue is reachable.
+    #[serde(default = "default_true")]
+    pub escape_cross_venue_hedge: bool,
 }
 
 fn default_max_per_underlying() -> u32 {
@@ -458,6 +565,18 @@ fn default_true() -> bool {
 }
 fn default_route_min_profit() -> f64 {
     2.0
+}
+fn default_escape_patience_frac() -> f64 {
+    0.35
+}
+fn default_escape_min_progress_frac() -> f64 {
+    0.25
+}
+fn default_escape_reversal_mult() -> f64 {
+    1.0
+}
+fn default_escape_deadline_s() -> f64 {
+    45.0
 }
 
 impl Default for ExecSettings {
@@ -482,6 +601,12 @@ impl Default for ExecSettings {
             max_per_underlying: 2,
             routes_enabled: true,
             route_min_profit_usd: 2.0,
+            escape_enabled: true,
+            escape_patience_frac: 0.35,
+            escape_min_progress_frac: 0.25,
+            escape_reversal_mult: 1.0,
+            escape_deadline_s: 45.0,
+            escape_cross_venue_hedge: true,
         }
     }
 }

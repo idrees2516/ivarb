@@ -147,6 +147,7 @@ fn ExecPlan(o: Opportunity) -> impl IntoView {
         ("theta burn", format!("{:.2} vp/day raw · hedged arb nets most of it", o.theta_vp_day)),
         ("patience / max hold", format!("{} / {}", fmt_secs(o.patience_s), fmt_secs(o.hold_s))),
         ("convergence hint", if o.conv_hint { "favorable — the rich leg is fading toward the cheap leg".into() } else { "neutral".into() }),
+        ("if not captured", "0DTE escape — hedge Δ on a third venue, both legs out at market, flat fast".into()),
     ];
     view! {
         <div class="exec-plan">

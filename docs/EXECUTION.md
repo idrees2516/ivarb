@@ -143,8 +143,65 @@ belt-and-suspenders layer on top.
 Both legs are the same strike/right, so deltas mostly cancel — but venue
 mark conventions and IV differences leave a residual. When `|residual ×
 spot| > hedge_threshold_usd` (default $250), the monitor trades the
-underlying on the buy-leg venue to flatten it. Hedge P&L is tracked
+underlying **on a third venue — deliberately neither option leg** — to
+flatten it (`escape_cross_venue_hedge`), preferring the perp books in
+liquidity order (bybit → okx → binance → delta → deribit, skipping any
+venue that is already carrying a leg). The structure's delta therefore
+never depends on a single venue's book: leg A on one exchange, leg B on a
+second, the perp hedge on a third. Hedge P&L is tracked
 separately (`hedge_pnl_usd`) so attribution stays honest.
+
+## 0DTE escape — uncaptured-arb rapid exit
+
+The exit ladder above assumes the arb *wants* to converge. When it does
+not, waiting is just paying theta for a thesis the market rejected. The
+escape system flips such positions into **same-day doctrine** — treat them
+as if the option expired today: hedge first, get flat fast, salvage what
+the structure still holds.
+
+**Detection** (pure function `escape_trigger`, unit-tested). A position
+flips when any of:
+
+| Trigger | Default | Meaning |
+|---|---|---|
+| Spread reversed | ≥ entry + 1.0× signal, after a 10 s grace | the divergence widened — the move went against us (the grace window absorbs post-fill quote bounce) |
+| Theta accelerating | ≥ 3× the budget schedule rate | decay is destroying edge faster than convergence can deliver it |
+| No convergence | < 25% of signal converged at 35% of the hold window | the edge is not coming to us |
+
+**The ladder** (`escape_step`, one phase per monitor beat, ~900 ms
+hedge-fill confirmation dwell between phases, hard flat-by deadline of
+45 s):
+
+```
+detect ──► hedge Δ on a THIRD venue ──► both legs out at market ──► hedge released, flat
+ (phase 0)   (phase 1: full residual       (phase 2: touch/mark/entry        (trade booked
+              neutralized before any         ladder, sane-banded prices,      ExitReason::Escaped0dte,
+              leg moves)                     hedge P&L booked)                own stats bucket)
+```
+
+The order is the whole point: **delta is neutralized before any leg
+moves**, so a failed arb can never decay into a directional bet during
+its exit. Past the deadline the close is forced at any price — flat
+beats price.
+
+**Cross-venue delta neutrality.** The two option legs sit on two venues
+by construction; the escape hedge goes to a *third* (perp-capable,
+liquidity-ordered, gateway-checked in live mode), and so does the
+incremental hold-period hedge. No single venue's book can gap the whole
+delta-neutral structure. Sim-feed namespaces (`sim:bybit`) are normalized
+so a venue is never picked "again" through a prefix mismatch, and paper
+hedges book against the same account fabric as the positions.
+
+**Settings** (UI-toggleable, env-overridable): `escape_enabled` (master
+switch, `⟁ 0DTE ESCAPE` in the taker bar), `escape_patience_frac`,
+`escape_min_progress_frac`, `escape_reversal_mult`,
+`escape_deadline_s`, `escape_cross_venue_hedge`.
+
+**Stats & attribution**: `escape_exits` / `escape_active` /
+`escape_salvaged_usd` / `escape_avg_s` — the salvage number is honest
+and frequently negative: a rapid exit of a failed capture usually gives
+back part of the entry spread. That is the price of not riding a dead
+thesis to the stop.
 
 ## Multi-leg route cycles (`route.rs`)
 
