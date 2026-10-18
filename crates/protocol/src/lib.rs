@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod research;
+
 use serde::{Deserialize, Serialize};
 
 pub type VenueId = String;

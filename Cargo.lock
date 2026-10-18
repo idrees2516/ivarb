@@ -1199,6 +1199,26 @@ name = "ivarb-quant"
 version = "0.1.0"
 
 [[package]]
+name = "ivarb-research"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "chrono",
+ "futures-util",
+ "ivarb-protocol",
+ "ivarb-quant",
+ "rand 0.8.8",
+ "reqwest",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "ivarb-server"
 version = "0.1.0"
 dependencies = [
@@ -1209,6 +1229,7 @@ dependencies = [
  "ivarb-engine",
  "ivarb-executor",
  "ivarb-protocol",
+ "ivarb-research",
  "mimalloc",
  "serde",
  "serde_json",

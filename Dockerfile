@@ -16,16 +16,10 @@ FROM rust:1-slim AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates pkg-config \
     && rm -rf /var/lib/apt/lists/*
-# WASM frontend toolchain (versions pinned to match Cargo.lock). Prebuilt
-# musl binaries keep the image build ~10 min faster than cargo install;
-# cargo install --locked stays as the source fallback.
-RUN rustup target add wasm32-unknown-unknown && \
-    curl -fsSL https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz \
-      | tar xz -C /usr/local/bin \
-      || cargo install --locked trunk --version 0.21.14 --no-default-features --features rustls; \
-    curl -fsSL https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.128/wasm-bindgen-0.2.128-x86_64-unknown-linux-musl.tar.gz \
-      | tar xz --strip-components=1 -C /usr/local/bin \
-      || cargo install --locked wasm-bindgen-cli --version 0.2.128
+# WASM frontend toolchain (versions pinned to match Cargo.lock)
+RUN rustup target add wasm32-unknown-unknown
+RUN cargo install --locked trunk --version 0.21.14 --no-default-features --features rustls
+RUN cargo install --locked wasm-bindgen-cli --version 0.2.128
 
 WORKDIR /app
 # Dependencies first (cached across source-only changes)

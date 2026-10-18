@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 
+mod api;
 mod app;
 mod chart;
 mod fmt;

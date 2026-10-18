@@ -1,14 +1,15 @@
-//! Derive (formerly Lyra v2) connector — live via the RPC API on
-//! `api.lyra.finance`.
+//! Derive (formerly Lyra) connector — live via the **v3 RPC API** on
+//! `api.derive.xyz`.
 //!
-//! Transport strategy ("whatever works", probed live on 2026-09-24):
-//! - `POST /public/get_instruments` `{expired:false, instrument_type:"option",
-//!   currency:UND}` → full option chain metadata (830 BTC rows), refreshed
-//!   every 10 minutes to pick up new expiries.
+//! Transport strategy ("whatever works", v3 probed live 2026-10-18 after the
+//! old `api.lyra.finance` host started serving 503s):
+//! - `POST /public/get_all_live_instruments` `{}` → every live instrument
+//!   name in one call (~3.9k); option names encode currency-expiry-strike-
+//!   right (`BTC-20261019-82000-C`), refreshed every 10 minutes.
 //! - `POST /public/get_tickers` `{instrument_type:"option", currency:UND,
 //!   expired:false, expiry_date:YYYYMMDD}` → **the whole expiry chain in one
-//!   call** (44-94 rows), including best bid/ask (+sizes), mark, index and the
-//!   venue's own IV surface (`option_pricing.{i,bi,ai}`).
+//!   call**, including best bid/ask (+sizes), mark, index and the venue's own
+//!   IV surface (`option_pricing.{i,bi,ai}`) — same compact keys as v2.
 //!
 //! One poll cycle = one request per (underlying × selected expiry) — the
 //! cheapest live transport available for this venue, no per-instrument calls.
@@ -254,47 +255,43 @@ impl VenueConnector for Derive {
 }
 
 impl Derive {
-    /// Refresh the (underlying → expiries → instruments) universe from
-    /// `get_instruments`, keeping strikes within the configured ATM band.
+    /// Refresh the (underlying → expiries → instruments) universe from the
+    /// v3 `public/get_all_live_instruments` endpoint (one call, names only —
+    /// the name encodes currency, expiry, strike and right), keeping strikes
+    /// within the configured ATM band.
     async fn refresh_universe(&mut self, ctx: &VenueCtx, unds: &[String]) -> anyhow::Result<usize> {
         let now = now_ms();
         let mut index = HashMap::new();
         let mut expiries: HashMap<String, Vec<u32>> = HashMap::new();
 
-        for und in unds {
-            let body = serde_json::json!({
-                "expired": false,
-                "instrument_type": "option",
-                "currency": und,
-            });
-            let v = http_post_json(
-                &ctx.http,
-                &format!("{}/public/get_instruments", ctx.spec.rest_base),
-                &body,
-            )
-            .await?;
-            if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-                anyhow::bail!("rpc error: {err}");
-            }
-            let rows = v
-                .get("result")
-                .and_then(|r| r.as_array())
-                .ok_or_else(|| anyhow::anyhow!("unexpected get_instruments shape"))?;
+        let v = http_post_json(
+            &ctx.http,
+            &format!("{}/public/get_all_live_instruments", ctx.spec.rest_base),
+            &serde_json::json!({}),
+        )
+        .await?;
+        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+            anyhow::bail!("rpc error: {err}");
+        }
+        let names = v
+            .get("result")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow::anyhow!("unexpected get_all_live_instruments shape"))?;
 
-            // Collect option expiries within the DTE window.
-            let mut dates: Vec<u32> = rows
-                .iter()
-                .filter_map(|r| {
-                    r.get("option_details")
-                        .and_then(|o| o.get("expiry"))
-                        .and_then(|e| e.as_i64())
-                        .map(|sec| {
-                            // unix sec → yyyymmdd (UTC)
-                            let days = (sec / 86_400) as u32;
-                            civil_from_days(days as i64)
-                        })
-                })
-                .collect();
+        // Collect (und → date → names) for the tracked underlyings.
+        let mut per: HashMap<String, HashMap<u32, Vec<&str>>> = HashMap::new();
+        for n in names {
+            let Some(name) = n.as_str() else { continue };
+            let Some((u, d, _k, _right)) = parse_option_symbol(name) else { continue };
+            if !unds.contains(&u) {
+                continue;
+            }
+            per.entry(u).or_default().entry(d).or_default().push(name);
+        }
+
+        for und in unds {
+            let Some(by_date) = per.get(und) else { continue };
+            let mut dates: Vec<u32> = by_date.keys().copied().collect();
             cap_expiries(
                 &mut dates,
                 now,
@@ -306,31 +303,31 @@ impl Derive {
 
             let und_id = ctx.intern(und);
             let spot = ctx.consensus_spot(und);
-            let mut kept = 0usize;
-            for r in rows {
-                let Some(name) = r.get("instrument_name").and_then(|n| n.as_str()) else { continue };
-                let Some((u, d, k, right)) = parse_option_symbol(name) else { continue };
-                if u != *und || !dates.contains(&d) {
-                    continue;
-                }
-                // Near-ATM band once a consensus spot exists.
-                if let Some(s) = spot {
-                    if s > 0.0 && ((k / s).ln().abs()) > ctx.cfg.atm_pct {
+            for date in &dates {
+                let Some(names) = by_date.get(date) else { continue };
+                for name in names {
+                    let Some((u, d, k, right)) = parse_option_symbol(name) else { continue };
+                    debug_assert_eq!(u.as_str(), und.as_str());
+                    if d != *date {
                         continue;
                     }
+                    // Near-ATM band once a consensus spot exists.
+                    if let Some(s) = spot {
+                        if s > 0.0 && ((k / s).ln().abs()) > ctx.cfg.atm_pct {
+                            continue;
+                        }
+                    }
+                    index.insert(
+                        name.to_string(),
+                        InstKey {
+                            und: und_id,
+                            date: d,
+                            strike_ticks: (k * 10_000.0).round() as u64,
+                            right,
+                        },
+                    );
                 }
-                index.insert(
-                    name.to_string(),
-                    InstKey {
-                        und: und_id,
-                        date: d,
-                        strike_ticks: (k * 10_000.0).round() as u64,
-                        right,
-                    },
-                );
-                kept += 1;
             }
-            let _ = kept;
         }
 
         if index.is_empty() {
@@ -350,6 +347,7 @@ impl Derive {
 }
 
 /// Days since epoch → yyyymmdd (Howard Hinnant's civil_from_days).
+#[cfg(test)]
 fn civil_from_days(z: i64) -> u32 {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

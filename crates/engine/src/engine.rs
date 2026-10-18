@@ -24,6 +24,7 @@ use ivarb_protocol::{
     ConnState, EdgeMode, EngineStats, FeedMode, HistoryPt, MultiHopRoute, Opportunity,
     ServerMsg, Snapshot, SpotQuote, VenueId, VenueStatus, WatchedLeg,
 };
+use ivarb_protocol::research::ChainDigestRow;
 
 use crate::config::{EngineConfig, VenueSpec};
 use crate::ga::{GaHandle, GaShared, GenomeView};
@@ -58,6 +59,9 @@ pub struct EngineHandles {
     /// Millisecond-fresh opportunity list for the executor's 1 ms scan loop
     /// (cheaper than republishing full snapshots).
     pub opps_light: Arc<ArcSwap<Vec<Opportunity>>>,
+    /// Bounded near-ATM digest of every venue quote book, consumed by the
+    /// research engine (agent / chains / IV analytics).
+    pub research_out: Arc<ArcSwap<ivarb_protocol::research::ChainDigest>>,
 }
 
 /// Replace the executor's watched-instrument set (canonical ids like
@@ -139,6 +143,8 @@ pub struct Engine {
     msgs_total: AtomicU64,
     loop_us_ewma: f64,
     instruments_tracked: u32,
+    /// Research digest output (near-ATM chain export).
+    research_out: Arc<ArcSwap<ivarb_protocol::research::ChainDigest>>,
 }
 
 fn log_signal_line(tx: &mpsc::Sender<String>, o: &Opportunity, event: &str, now: i64) {
@@ -181,6 +187,7 @@ impl Engine {
         watched_out: Arc<ArcSwap<FxHashMap<String, Vec<WatchedLeg>>>>,
         ga: GaHandle,
         opps_light: Arc<ArcSwap<Vec<Opportunity>>>,
+        research_out: Arc<ArcSwap<ivarb_protocol::research::ChainDigest>>,
     ) -> Self {
         let mut venues = FxHashMap::default();
         for spec in &cfg.venues {
@@ -255,6 +262,7 @@ impl Engine {
             msgs_total: AtomicU64::new(0),
             loop_us_ewma: 0.0,
             instruments_tracked: 0,
+            research_out,
         }
     }
 
@@ -267,10 +275,12 @@ impl Engine {
         let mut snap_tick = tokio::time::interval(Duration::from_millis(self.cfg.snapshot_ms));
         let mut mh_tick = tokio::time::interval(Duration::from_millis(self.cfg.multihop_ms));
         let mut ga_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut research_tick = tokio::time::interval(Duration::from_secs(4));
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         mh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ga_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        research_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -299,6 +309,7 @@ impl Engine {
                     self.publish_snapshot();
                     self.broadcast(ServerMsg::Stats { stats: self.stats() });
                 }
+                _ = research_tick.tick() => self.publish_research_digest(),
                 _ = self.shutdown.changed() => {
                     if *self.shutdown.borrow() { break; }
                 }
@@ -895,6 +906,143 @@ impl Engine {
         if self.bcast.receiver_count() > 0 {
             self.wire_hist.record_us(t0.elapsed().as_micros() as f64);
         }
+    }
+
+    /// Publish the bounded near-ATM chain digest for the research engine
+    /// (every 4 s). Keeps only quotes fresher than 90 s, DTE 0..=90, strikes
+    /// within ±12% (log) of the consensus spot, at most 5 expiries and 20
+    /// strikes per (und, expiry, right) — bounded so the ArcSwap stays cheap.
+    fn publish_research_digest(&self) {
+        const MAX_DTE: i64 = 90;
+        const MAX_EXPIRIES: usize = 5;
+        const STRIKE_WINDOW: f64 = 0.22; // log-moneyness ± (covers ~25Δ wings at 30d)
+        const MAX_STRIKES: usize = 26;
+        const FRESH_MS: i64 = 90_000;
+
+        let now = now_ms();
+        // Venue name table (index into `venue_list`).
+        let venue_list: Vec<String> = self.venues.keys().cloned().collect();
+        // (und, date, right) → (|log-moneyness|, venue idx, key, quote)
+        let mut buckets: rustc_hash::FxHashMap<
+            (u16, u32, u8),
+            Vec<(f64, usize, InstKey, &LegQuote)>,
+        > = FxHashMap::default();
+        let mut und_names: rustc_hash::FxHashMap<u16, String> = FxHashMap::default();
+        let configured: rustc_hash::FxHashSet<&str> =
+            self.cfg.underlyings.iter().map(|s| s.as_str()).collect();
+
+        for (v_idx, (v_name, rt)) in self.venues.iter().enumerate() {
+            debug_assert_eq!(venue_list.get(v_idx).map(String::as_str), Some(v_name.as_str()));
+            if rt.status.state == ConnState::Disabled {
+                continue;
+            }
+            for (key, q) in &rt.quotes {
+                if now - q.recv_ms > FRESH_MS {
+                    continue;
+                }
+                let und = match und_names.entry(key.und) {
+                    std::collections::hash_map::Entry::Occupied(o) => o.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        let name = self
+                            .interner
+                            .lock()
+                            .ok()
+                            .and_then(|i| Some(i.name(key.und).to_string()))
+                            .unwrap_or_default();
+                        v.insert(name.clone());
+                        name
+                    }
+                };
+                if und.is_empty() || !configured.contains(und.as_str()) {
+                    continue;
+                }
+                let Some(spot) = self.consensus.get(&und) else {
+                    continue;
+                };
+                if *spot <= 0.0 || !spot.is_finite() {
+                    continue;
+                }
+                let Some(exp) = ymd_to_expiry_ms(key.date) else {
+                    continue;
+                };
+                let dte = (exp - now) / 86_400_000;
+                if !(0..=MAX_DTE).contains(&dte) {
+                    continue;
+                }
+                // Need at least one usable number.
+                if q.px_mark_unit.is_none()
+                    && q.px_bid_unit.is_none()
+                    && q.px_ask_unit.is_none()
+                    && q.iv_mark_vp.is_none()
+                {
+                    continue;
+                }
+                let lm = (key.strike() / *spot).ln().abs();
+                if lm > STRIKE_WINDOW {
+                    continue;
+                }
+                buckets
+                    .entry((key.und, key.date, key.right))
+                    .or_default()
+                    .push((lm, v_idx, *key, q));
+            }
+        }
+
+        // Cap expiries per underlying (nearest first) and strikes per bucket.
+        let mut dates_per_und: rustc_hash::FxHashMap<u16, Vec<u32>> = FxHashMap::default();
+        for ((und, date, _), v) in buckets.iter_mut() {
+            v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            v.truncate(MAX_STRIKES);
+            dates_per_und.entry(*und).or_default().push(*date);
+        }
+        let mut keep_dates: rustc_hash::FxHashSet<(u16, u32)> = rustc_hash::FxHashSet::default();
+        keep_dates.extend(
+            dates_per_und
+                .into_iter()
+                .flat_map(|(und, mut ds)| {
+                    ds.sort_unstable();
+                    ds.dedup();
+                    ds.truncate(MAX_EXPIRIES);
+                    ds.into_iter().map(move |d| (und, d))
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let mut rows: Vec<ChainDigestRow> = Vec::with_capacity(1024);
+        for ((und_id, date, right), v) in buckets {
+            if !keep_dates.contains(&(und_id, date)) {
+                continue;
+            }
+            let und = und_names.get(&und_id).cloned().unwrap_or_default();
+            if und.is_empty() {
+                continue;
+            }
+            for (_, v_idx, key, q) in v {
+                rows.push(ChainDigestRow {
+                    venue: venue_list.get(v_idx).cloned().unwrap_or_default(),
+                    und: und.clone(),
+                    date,
+                    strike: key.strike(),
+                    right: if right == crate::key::RIGHT_CALL {
+                        ivarb_protocol::Right::Call
+                    } else {
+                        ivarb_protocol::Right::Put
+                    },
+                    mark_px: q.px_mark_unit,
+                    bid_px: q.px_bid_unit,
+                    ask_px: q.px_ask_unit,
+                    iv_mark_vp: q.iv_mark_vp,
+                    iv_bid_vp: q.iv_bid_vp,
+                    iv_ask_vp: q.iv_ask_vp,
+                    size_bid: q.size_bid,
+                    size_ask: q.size_ask,
+                    ts_ms: q.recv_ms,
+                });
+            }
+        }
+
+        let digest = ivarb_protocol::research::ChainDigest { ts_ms: now, rows };
+        self.research_out.store(Arc::new(digest));
     }
 
     fn bcast_venues(&mut self) {

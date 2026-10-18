@@ -140,8 +140,15 @@ encoded per connector:
 - **Bybit** marks IVs on its own forward (≈ futures) — the scanner never
   mixes venue IVs (see "premium truth" below); margin token needs the
   trailing `-USDT` stripped.
-- **Binance** `/mark` lacks index price and `/eapi/v1/ticker` provides
-  whole-market executable prices, joined into the poll.
+- **Binance** unified its options market streams onto the futures host
+  (`wss://fstream.binance.com/public`, `nbstream.binance.com` is dead) →
+  top-5 books with sizes @100 ms (`{sym}@depth5@100ms`) sharded across
+  connections (200-stream cap), all-underlying index via `!index@arr` on the
+  `/market` root, and a gentle 60 s REST `/mark` for venue mark IVs. The old
+  5 s `/mark`+`/ticker` polling burned ~600 request-weight/min against
+  eapi's 400/min IP budget (the whole-market `/ticker` alone is weight 40),
+  earning permanent 429 → 418 auto-bans; executable bid/ask IVs are now
+  Black-Scholes solved from the 100 ms book instead.
 - **Delta** right-first symbols (`C-BTC-83400-260926`) with DDMMYY dates
   and dict-wrapped responses.
 - **Aevo** `/markets` needs a long timeout; per-instrument order books

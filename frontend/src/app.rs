@@ -5,7 +5,9 @@
 use leptos::prelude::*;
 
 use crate::fmt;
-use crate::sections::{calc, funding, ga, holdlab, multihop, risk, scanner, steps, taker, venues};
+use crate::sections::{
+    calc, funding, ga, holdlab, multihop, research, risk, scanner, steps, taker, venues,
+};
 use crate::state::{ApiState, WsState};
 
 #[component]
@@ -20,6 +22,7 @@ pub fn App() -> impl IntoView {
             <Hero/>
             <main class="content">
                 <scanner::ScannerSection/>
+                <research::ResearchSection/>
                 <LegendSection/>
                 <taker::TakerSection/>
                 <funding::FundingSection/>
@@ -287,6 +290,7 @@ fn Hero() -> impl IntoView {
                     <span class="tag">"time-aware strategies"</span>
                     <span class="tag">"millisecond pipeline"</span>
                     <span class="tag">"multi-hop + genetic optimizer"</span>
+                    <span class="tag">"agentic research desk"</span>
                 </div>
             </div>
             <div class="hero-stats">
@@ -391,6 +395,7 @@ fn Footer() -> impl IntoView {
                     <h3>"Where to go next"</h3>
                     <ul>
                         <li><a href="#scanner">"Open the scanner to see live arb opportunities"</a></li>
+                        <li><a href="#research">"Ask the research agent to build a market-coherent option structure"</a></li>
                         <li><a href="#math">"Model your P&L at different IV outcomes in the calculator"</a></li>
                         <li><a href="#scanner">"Check the lead-lag hint on any opportunity to see which exchange is likely to revert"</a></li>
                     </ul>

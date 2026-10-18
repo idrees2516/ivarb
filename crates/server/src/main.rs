@@ -34,7 +34,10 @@ use ivarb_executor::{spawn as spawn_executor, ExecDeps};
 use ivarb_protocol::{
     ClientMsg, ExecCommand, ExecSnapshot, GaCommand, GaStatus, ServerMsg, Snapshot,
 };
+use ivarb_research::{spawn as spawn_research, ResearchDeps, ResearchHandle};
 use tokio::sync::{broadcast, mpsc};
+
+mod research_api;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -47,6 +50,8 @@ pub struct AppState {
     pub exec_cmd: mpsc::UnboundedSender<ExecCommand>,
     /// Genetic-optimizer handle (status reads + commands).
     pub ga: GaHandle,
+    /// Agentic research plane (chains / candles / IV / liquidity / agent).
+    pub research: ResearchHandle,
 }
 
 fn now_ms() -> i64 {
@@ -90,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
     let cfg = EngineConfig::from_env();
     std::fs::create_dir_all(&cfg.data_dir)?;
     let data_dir = cfg.data_dir.clone();
+    // Underlyings for the research plane (captured before the engine
+    // consumes the config).
+    let research_unds = cfg.underlyings.clone();
     // Executor cadences (IVARB_EXEC_* overrides) — captured before the
     // engine consumes the config.
     let (exec_scan_ms, exec_monitor_ms, exec_push_ms) = (
@@ -119,6 +127,12 @@ async fn main() -> anyhow::Result<()> {
         exec_snap: exec.snapshot.clone(),
         exec_cmd: exec.cmd_tx.clone(),
         ga: handles.ga.clone(),
+        research: spawn_research(ResearchDeps {
+            digest: handles.research_out.clone(),
+            snapshot: handles.snapshot.clone(),
+            shutdown: handles.shutdown.subscribe(),
+            underlyings: research_unds,
+        }),
     };
 
     // GA status pump: the optimizer thread is event-driven (own OS thread,
@@ -178,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/ga/cmd", post(api_ga_cmd))
             .route("/api/exec", get(api_exec))
             .route("/api/exec/cmd", post(api_exec_cmd))
+            .merge(research_api::router())
             .route("/healthz", get(healthz))
             .route("/metrics", get(metrics))
             .fallback_service(serve)
@@ -194,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/ga/cmd", post(api_ga_cmd))
             .route("/api/exec", get(api_exec))
             .route("/api/exec/cmd", post(api_exec_cmd))
+            .merge(research_api::router())
             .route("/healthz", get(healthz))
             .route("/metrics", get(metrics))
             .fallback(get(frontend_missing))

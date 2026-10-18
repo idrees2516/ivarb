@@ -4,6 +4,7 @@ pub mod funding;
 pub mod ga;
 pub mod holdlab;
 pub mod multihop;
+pub mod research;
 pub mod risk;
 pub mod scanner;
 pub mod steps;

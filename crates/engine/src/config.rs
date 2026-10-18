@@ -199,9 +199,13 @@ pub fn default_venues() -> Vec<VenueSpec> {
             taker_fee_rate: 0.0002,
             coin_margined: false,
             contract_size: 0.01,
-            ws_url: "wss://nbstream.binance.com/eoptions/ws".into(),
+            // Unified options market streams now live on the futures host
+            // (nbstream.binance.com is dead). Books: /public, index: /market.
+            ws_url: "wss://fstream.binance.com/public/stream".into(),
             rest_base: "https://eapi.binance.com".into(),
-            poll_ms: 5_000,
+            // Books/spot arrive via WS at 100ms; poll_ms only paces the gentle
+            // 60s mark refresh (eapi weight budget is 400/min per IP).
+            poll_ms: 60_000,
             enabled: true,
         },
         VenueSpec {
@@ -233,10 +237,12 @@ pub fn default_venues() -> Vec<VenueSpec> {
             taker_fee_rate: 0.0003,
             coin_margined: false,
             contract_size: 1.0,
-            // Derive's RPC API lives on the lyra.finance host (probed live:
-            // POST /public/get_instruments + /public/get_tickers per expiry).
-            ws_url: "wss://api.lyra.finance/ws".into(),
-            rest_base: "https://api.lyra.finance".into(),
+            // Derive v3 API (the old api.lyra.finance v2 host began serving
+            // 503s on 2026-10-18; v3 was probed live: POST /v3/public/
+            // get_all_live_instruments + /v3/public/get_tickers per expiry,
+            // identical compact-key ticker payload).
+            ws_url: "wss://api.derive.xyz/v3/ws".into(),
+            rest_base: "https://api.derive.xyz/v3".into(),
             poll_ms: 6_000,
             enabled: true,
         },

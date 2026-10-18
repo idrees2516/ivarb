@@ -17,6 +17,17 @@ and a liveness probe. All JSON is serde-generated from
 | POST | `/api/ga/cmd` | control the optimizer (`GaCommand`) |
 | GET | `/api/exec` | `ExecSnapshot` — taker state (below) |
 | POST | `/api/exec/cmd` | control the taker (`ExecCommand`, below) |
+| GET | `/api/research/pulse` | research one-glance state + per-venue stats (see docs/RESEARCH.md) |
+| GET | `/api/research/chain?und=BTC[&expiry=&right=&window=&limit=]` | consolidated cross-venue option chain (venue quotes carry `tick_age_ms` when a 50 ms-class feed covers the instrument) |
+| GET | `/api/research/ticks?und=BTC[&limit=]` | **tick-level BBO plane**: fresh Paradex `order_book @15@50ms` snapshots + Derive v3 `ticker_slim @100ms` quotes — bid/ask + sizes, spread, IV, venue seq, exchange ts, per-quote age (ms) + per-feed health (connected / subs / frames / last-frame age) |
+| GET | `/api/research/candles?und=BTC&interval=1h` | underlying candles + EMA/BB/RSI/ATR overlays + readout |
+| GET | `/api/research/iv?und=BTC` | IV term structure, skew, percentile, cross-venue divergences |
+| GET | `/api/research/liquidity?und=BTC` | strike × expiry resting-depth heatmap |
+| GET | `/api/research/venues` | per-venue research stats (instruments, ATM IV, spread, OI, volume) |
+| GET | `/api/research/expiries?und=BTC` | listed expiries `(yyyymmdd, iso, dte)` |
+| GET | `/api/research/status` | research-plane health (digest, enrichment, klines, paradex — `paradex_quotes`, `paradex_ws`; tick plane — `paradex_book` + `paradex_book_subs` (50 ms book feed), `derive_ws` + `derive_subs` (v3 ticker feed), `tick_markets` + `tick_note`; llm) |
+| POST | `/api/research/agent` | `{"query":"…"}` or `{und,view,horizon_days,risk}` → `AgentRun` (tool trace + grounded answer + structure cards) |
+| POST | `/api/research/suggest` | `{und,view,horizon_days,risk}` → `SuggestionCard` (direct builder call) |
 | GET | `/healthz` | `{"ok":true,"ts":…}` |
 | GET | `/metrics` | Prometheus text exposition |
 | GET | `/*` | static dashboard (`index.html` + WASM assets) |

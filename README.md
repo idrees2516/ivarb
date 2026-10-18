@@ -23,7 +23,8 @@ dashboard — no Node, no Python, no browser-side crypto.
 | **Instruments** | ~5,000+ live options across BTC / ETH / SOL |
 | **Edge model** | Executable-touch premium truth (forward-basis-proof), fee-adjusted vol points |
 | **Execution** | Paper (realistic latency/slippage/partials) + live gateways: Deribit WS, Bybit V5, OKX v5, Binance eapi (triple-gated) + on-chain Uniswap V3 swaps on Base/Arbitrum/Optimism/Ethereum |
-| **Tests** | 59 unit/integration tests across quant, engine, executor |
+| **Research plane** | Agentic research system: consolidated cross-venue book, candles + indicators, IV analytics, liquidity heatmaps, Paradex TradeOptions universe (crypto + legacy underlyings), tool-calling agent (deterministic desk brain, optional OpenAI-compatible LLM brain), market-coherent option builder, **tick-level BBO plane** (Paradex 50 ms order-book snapshots + Derive v3 100 ms tickers) driving stricter execution routing |
+| **Tests** | 121 unit/integration tests across quant, engine, executor, research |
 | **Runtime footprint** | Single process, ~80 MB RSS, µs-level scan loop |
 
 ---
@@ -61,11 +62,15 @@ crates/
               formulas, hold-to-expiry analytics, cost sheets (zero deps)
   engine/     Venue connectors (WS/REST), normalizer, scanner/strategy,
               timing tiers, OU/Kalman analytics, hold lab, multi-hop,
-              genetic optimizer, sim feed
+              genetic optimizer, sim feed, research chain tap
   executor/   Advantage taker: risk preflight, SNIPER/CONVERGENCE state
               machines, paper broker, venue router (Deribit/Bybit/
               OKX/Binance live gateways + EVM chain gateway), route
               calibration, delta hedger
+  research/   Agentic research plane: cross-venue consolidation, candles +
+              indicators, IV analytics, liquidity maps, Paradex universe,
+              tool-calling agent (desk / OpenAI-compatible LLM brains),
+              market-coherent option builder
   server/     Axum HTTP/WS server, REST API, Prometheus /metrics, static
               frontend, JSONL audit writer, graceful shutdown
 frontend/     Leptos 0.8 CSR dashboard → trunk → WASM (served by the server)
@@ -105,10 +110,6 @@ fees.
 docker compose up -d                     # http://localhost:3000
 curl -s localhost:3000/healthz           # liveness
 curl -s localhost:3000/metrics           # Prometheus
-
-# Vercel (multi-service: container server + static WASM frontend)
-# import the repo on vercel.com — the root vercel.json defines both
-# services and the public routing; nothing else to configure
 ```
 
 Configuration is environment-driven with sane defaults — see
@@ -133,10 +134,11 @@ arming procedure.
 | Document | Contents |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate-by-crate internals, threading model, data flow, hot paths, wire protocol |
+| [docs/RESEARCH.md](docs/RESEARCH.md) | The agentic research system: consolidated cross-venue data plane, tool-calling agent (desk + LLM brains), the market-coherent option builder, Paradex TradeOptions universe |
 | [docs/EXECUTION.md](docs/EXECUTION.md) | The advantage taker: risk gates, state machines, sizing math, exits, hedging, calibration, live path |
 | [docs/STRATEGY.md](docs/STRATEGY.md) | Edge model, time-aware tiers, EV, hold-to-expiry lab, multi-hop, genetic optimizer |
 | [docs/COSTS-AND-CAPITAL.md](docs/COSTS-AND-CAPITAL.md) | Comprehensive cost sheets, margin formulas, funding rails, capital requirements, profit attribution |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, compose, systemd, Vercel multi-service, env reference, monitoring, ops runbook |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, compose, systemd, env reference, monitoring, ops runbook |
 | [docs/API.md](docs/API.md) | REST + WebSocket reference |
 | [docs/LIVE-TRADING.md](docs/LIVE-TRADING.md) | Real-venue gateways (Deribit/Bybit/OKX/Binance) + on-chain EVM/Uniswap execution: setup, safety model, verification |
 

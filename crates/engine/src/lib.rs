@@ -102,6 +102,9 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
     let (watch_tx, watch_rx) = mpsc::unbounded_channel::<engine::WatchCmd>();
     let watched: Arc<ArcSwap<FxHashMap<String, Vec<ivarb_protocol::WatchedLeg>>>> =
         Arc::new(ArcSwap::from_pointee(FxHashMap::default()));
+    let research_out: Arc<ArcSwap<ivarb_protocol::research::ChainDigest>> = Arc::new(
+        ArcSwap::from_pointee(ivarb_protocol::research::ChainDigest::default()),
+    );
     let interner = Arc::new(std::sync::Mutex::new(key::UnderlyingInterner::default()));
     let spots_shared: Arc<ArcSwap<FxHashMap<String, f64>>> =
         Arc::new(ArcSwap::from_pointee(FxHashMap::default()));
@@ -169,6 +172,7 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
         watched.clone(),
         ga.clone(),
         opps_light.clone(),
+        research_out.clone(),
     )
     .run());
 
@@ -253,5 +257,6 @@ pub fn spawn(cfg: EngineConfig) -> anyhow::Result<EngineHandles> {
         watched,
         ga,
         opps_light,
+        research_out,
     })
 }
